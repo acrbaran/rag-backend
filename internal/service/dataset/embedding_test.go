@@ -69,7 +69,7 @@ type embeddingProtocolDriver struct {
 func (d *embeddingProtocolDriver) Embed(
 	context.Context,
 	*string,
-	[]string,
+	modelModule.EmbedRequest,
 	*modelModule.APIConfig,
 	*modelModule.EmbeddingConfig,
 	*common.ModelUsage,
@@ -445,11 +445,11 @@ func TestDatasetEncodeEmbeddingRejectsNonFiniteVectors(t *testing.T) {
 
 func TestCheckEmbeddingRejectsProviderDimensionMismatch(t *testing.T) {
 	tests := []struct {
-		name       string
-		vectors    [][]float64
-		stored     []interface{}
-		wantCode   common.ErrorCode
-		wantErr    string
+		name     string
+		vectors  [][]float64
+		stored   []interface{}
+		wantCode common.ErrorCode
+		wantErr  string
 	}{
 		{
 			name:     "title and content differ",
@@ -689,7 +689,6 @@ func TestSampleRandomChunksWithVectorsRejectsInsufficientValidSamples(t *testing
 	}
 }
 
-
 type embeddingByTextDriver struct {
 	modelModule.ModelDriver
 	vectors map[string][]float64
@@ -698,13 +697,13 @@ type embeddingByTextDriver struct {
 func (d *embeddingByTextDriver) Embed(
 	_ context.Context,
 	_ *string,
-	texts []string,
+	request modelModule.EmbedRequest,
 	_ *modelModule.APIConfig,
 	_ *modelModule.EmbeddingConfig,
 	_ *common.ModelUsage,
 ) ([]modelModule.EmbeddingData, error) {
-	result := make([]modelModule.EmbeddingData, 0, len(texts))
-	for _, text := range texts {
+	result := make([]modelModule.EmbeddingData, 0, len(request.Texts))
+	for _, text := range request.Texts {
 		vector, ok := d.vectors[text]
 		if !ok {
 			return nil, errors.New("unexpected embedding text")

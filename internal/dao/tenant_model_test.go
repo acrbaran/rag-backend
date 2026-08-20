@@ -17,7 +17,6 @@
 package dao
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -114,7 +113,7 @@ func TestTenantModelDAODeleteByModelIDAndScopeDeletesOnlyMatchingModel(t *testin
 	seedTenantModel(t, db, &entity.TenantModel{ID: "model-delete", ModelName: "m", ModelType: int(entity.ModelTypeChat), ProviderID: "provider-1", InstanceID: "instance-1", Status: "active"})
 	seedTenantModel(t, db, &entity.TenantModel{ID: "model-keep", ModelName: "m", ModelType: int(entity.ModelTypeChat), ProviderID: "provider-1", InstanceID: "instance-2", Status: "active"})
 
-	ctx := context.Background()
+	ctx := t.Context()
 	rows, err := NewTenantModelDAO().DeleteByModelIDAndProviderIDAndInstanceID(ctx, db, "model-delete", "provider-1", "instance-1")
 	if err != nil {
 		t.Fatalf("DeleteByModelIDAndProviderIDAndInstanceID() error = %v", err)
@@ -135,6 +134,52 @@ func TestTenantModelDAODeleteByModelIDAndScopeDeletesOnlyMatchingModel(t *testin
 	}
 	if count != 1 {
 		t.Fatalf("kept model count = %d, want 1", count)
+	}
+}
+
+func TestTenantModelDAOUpdateStatusWithUpdateByIDAndScope(t *testing.T) {
+	db := setupTenantModelDAOTestDB(t)
+	useTenantModelDAOTestDB(t, db)
+
+	seedTenantModel(t, db, &entity.TenantModel{ID: "model-status", ModelName: "m", ModelType: int(entity.ModelTypeChat), ProviderID: "provider-1", InstanceID: "instance-1", Status: "active"})
+
+	ctx := t.Context()
+	rows, err := NewTenantModelDAO().UpdateByIDAndScope(
+		ctx,
+		db,
+		"model-status",
+		"provider-1",
+		"instance-1",
+		map[string]interface{}{"status": "inactive"},
+	)
+	if err != nil {
+		t.Fatalf("UpdateByIDAndScope() error = %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("rows = %d, want 1", rows)
+	}
+
+	var got entity.TenantModel
+	if err = db.Where("id = ?", "model-status").First(&got).Error; err != nil {
+		t.Fatalf("failed to reload model: %v", err)
+	}
+	if got.Status != "inactive" {
+		t.Fatalf("status = %q, want inactive", got.Status)
+	}
+
+	rows, err = NewTenantModelDAO().UpdateByIDAndScope(
+		ctx,
+		db,
+		"model-status",
+		"provider-1",
+		"wrong-instance",
+		map[string]interface{}{"status": "active"},
+	)
+	if err != nil {
+		t.Fatalf("UpdateByIDAndScope() wrong scope error = %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("wrong-scope rows = %d, want 0", rows)
 	}
 }
 

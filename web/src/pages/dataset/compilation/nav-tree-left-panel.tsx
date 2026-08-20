@@ -1,5 +1,6 @@
 import { ConfirmDeleteDialog } from '@/components/confirm-delete-dialog';
 import { Button } from '@/components/ui/button';
+import { SearchInput } from '@/components/ui/input';
 import { Spin } from '@/components/ui/spin';
 import { TreeView } from '@/components/ui/tree-view';
 import {
@@ -42,8 +43,8 @@ function NavNodeDeleteAction({
 
   return (
     <ConfirmDeleteDialog
-      title={t('datasetNav.deleteNodeTitle')}
-      content={{ title: t('datasetNav.deleteNodeDescription') }}
+      title={t('knowledgeCompilation.navDeleteNodeTitle')}
+      content={{ title: t('knowledgeCompilation.navDeleteNodeDescription') }}
       onOk={handleConfirmDelete}
     >
       <Button
@@ -65,10 +66,12 @@ function NavNodeDeleteAction({
 type NavTreeLeftPanelProps = {
   navList: DatasetNavList | null;
   navLoading: boolean;
+  keywords: string;
   childrenMap: Record<string, DatasetNavNode[]>;
   structureMap: Record<string, IStructureGraphTemplate[]>;
   deleteNavLoading: boolean;
   deleteNodeLoading: boolean;
+  onKeywordsChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
   onNodeClick: (node: DatasetNavNode, parentName: string | null) => void;
   onNodeExpand: (node: DatasetNavNode) => void;
   onEntityClick: NavEntityClickHandler;
@@ -79,10 +82,12 @@ type NavTreeLeftPanelProps = {
 export function NavTreeLeftPanel({
   navList,
   navLoading,
+  keywords,
   childrenMap,
   structureMap,
   deleteNavLoading,
   deleteNodeLoading,
+  onKeywordsChange,
   onNodeClick,
   onNodeExpand,
   onEntityClick,
@@ -112,7 +117,7 @@ export function NavTreeLeftPanel({
         onNodeClick,
         onNodeExpand,
         onEntityClick,
-        loadingPlaceholder: t('datasetNav.loading'),
+        loadingPlaceholder: t('knowledgeCompilation.navLoading'),
       }),
     [
       navList?.items,
@@ -130,12 +135,12 @@ export function NavTreeLeftPanel({
     <aside className="size-full flex flex-col">
       <section className="flex items-center justify-between px-3 pt-3">
         <span className="text-sm font-medium text-text-primary">
-          {t('datasetNav.title')} ({navList?.total ?? 0})
+          {t('knowledgeCompilation.navTitle')} ({navList?.total ?? 0})
         </span>
         {treeData.length > 0 && (
           <ConfirmDeleteDialog
-            title={t('datasetNav.deleteAllTitle')}
-            content={{ title: t('datasetNav.deleteAllDescription') }}
+            title={t('knowledgeCompilation.navDeleteAllTitle')}
+            content={{ title: t('knowledgeCompilation.navDeleteAllDescription') }}
             onOk={onDeleteAll}
           >
             <Button
@@ -150,6 +155,10 @@ export function NavTreeLeftPanel({
         )}
       </section>
 
+      <div className="px-3 pt-2">
+        <SearchInput value={keywords} onChange={onKeywordsChange} />
+      </div>
+
       <div className="flex-1 min-h-0 overflow-y-auto px-1 pt-2 pb-3">
         {navLoading && treeData.length === 0 ? (
           <div className="py-8 flex justify-center">
@@ -157,7 +166,7 @@ export function NavTreeLeftPanel({
           </div>
         ) : treeData.length === 0 ? (
           <div className="py-8 text-center text-sm text-text-secondary">
-            {t('datasetNav.empty')}
+            {t('knowledgeCompilation.navEmpty')}
           </div>
         ) : (
           <TreeView
