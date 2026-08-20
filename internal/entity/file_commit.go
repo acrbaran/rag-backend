@@ -76,12 +76,14 @@ type TreeNode struct {
 
 // FileChange represents a file change in a commit request.
 type FileChange struct {
-	FileID    string `json:"file_id"`
-	FileName  string `json:"file_name"`
-	Operation string `json:"operation"` // "add", "modify", "delete", "rename"
-	Content   string `json:"content,omitempty"`
-	OldName   string `json:"old_name,omitempty"`
-	NewName   string `json:"new_name,omitempty"`
+	FileID      string `json:"file_id"`
+	FileName    string `json:"file_name"`
+	Operation   string `json:"operation"` // "add", "modify", "delete", "rename", "move"
+	Content     string `json:"content,omitempty"`
+	OldName     string `json:"old_name,omitempty"`
+	NewName     string `json:"new_name,omitempty"`
+	OldParentID string `json:"old_parent_id,omitempty"`
+	NewParentID string `json:"new_parent_id,omitempty"`
 }
 
 // CommitResponse is the API response for a commit.
@@ -105,6 +107,10 @@ type DiffEntry struct {
 	NewHash     *string `json:"new_hash,omitempty"`
 	OldLocation *string `json:"old_location,omitempty"`
 	NewLocation *string `json:"new_location,omitempty"`
+	OldName     *string `json:"old_name,omitempty"`
+	NewName     *string `json:"new_name,omitempty"`
+	OldParentID *string `json:"old_parent_id,omitempty"`
+	NewParentID *string `json:"new_parent_id,omitempty"`
 }
 
 // VersionEntry represents a single version in a file's version history.

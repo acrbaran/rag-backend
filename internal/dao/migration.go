@@ -18,10 +18,14 @@ package dao
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"ragflow/internal/common"
 	"ragflow/internal/entity"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 	"gorm.io/gorm"
@@ -33,6 +37,10 @@ func RunMigrations(ctx context.Context, db *gorm.DB) error {
 	// Check if tenant_llm table has composite primary key and migrate to ID primary key
 	if err := migrateTenantLLMPrimaryKey(ctx, db); err != nil {
 		return fmt.Errorf("failed to migrate tenant_llm primary key: %w", err)
+	}
+
+	if err := migrateTenantModelTypeSchema(ctx, db); err != nil {
+		return fmt.Errorf("failed to migrate tenant model type schema: %w", err)
 	}
 
 	// Rename columns (correct typos)
@@ -70,6 +78,245 @@ func RunMigrations(ctx context.Context, db *gorm.DB) error {
 
 	common.Info("All manual migrations completed successfully")
 	return nil
+}
+
+var legacyTenantModelTypes = map[string]int{
+	"chat":        int(entity.ModelTypeChat),
+	"embedding":   int(entity.ModelTypeEmbedding),
+	"asr":         int(entity.ModelTypeSpeech2Text),
+	"speech2text": int(entity.ModelTypeSpeech2Text),
+	"vision":      int(entity.ModelTypeImage2Text),
+	"image2text":  int(entity.ModelTypeImage2Text),
+	"rerank":      int(entity.ModelTypeRerank),
+	"tts":         int(entity.ModelTypeTTS),
+	"ocr":         int(entity.ModelTypeOCR),
+}
+
+const (
+	requiredStartupMigrationLockPrefix         = "ragflow_required_startup_migrations"
+	requiredStartupMigrationLockTimeout        = 30 * time.Second
+	requiredStartupMigrationLockReleaseTimeout = 5 * time.Second
+	tenantModelTypeMaskMax                     = int(entity.ModelTypeChat | entity.ModelTypeEmbedding | entity.ModelTypeSpeech2Text | entity.ModelTypeImage2Text | entity.ModelTypeRerank | entity.ModelTypeTTS | entity.ModelTypeOCR)
+)
+
+func requiredStartupMigrationLockName(databaseName string) string {
+	digest := sha256.Sum256([]byte(databaseName))
+	return fmt.Sprintf("%s_%x", requiredStartupMigrationLockPrefix, digest[:8])
+}
+
+type tenantModelTypeColumn struct {
+	DataType   string `gorm:"column:DATA_TYPE"`
+	IsNullable string `gorm:"column:IS_NULLABLE"`
+}
+
+// RunRequiredStartupMigrations runs schema changes required for every Go
+// process before it starts serving or consuming work.
+func RunRequiredStartupMigrations(ctx context.Context, db *gorm.DB, migrateDB bool) error {
+	if db == nil {
+		return fmt.Errorf("required startup migrations: database is nil")
+	}
+
+	return db.WithContext(ctx).Connection(func(conn *gorm.DB) (resultErr error) {
+		var databaseName string
+		if err := conn.Raw("SELECT DATABASE()").Scan(&databaseName).Error; err != nil {
+			return fmt.Errorf("inspect database name for required startup migrations: %w", err)
+		}
+		if databaseName == "" {
+			return fmt.Errorf("inspect database name for required startup migrations: no database selected")
+		}
+		lockName := requiredStartupMigrationLockName(databaseName)
+
+		var acquired struct {
+			Value *int64 `gorm:"column:lock_result"`
+		}
+		if err := conn.Raw(
+			"SELECT GET_LOCK(?, ?) AS lock_result",
+			lockName,
+			int(requiredStartupMigrationLockTimeout/time.Second),
+		).Scan(&acquired).Error; err != nil {
+			return fmt.Errorf("acquire required startup migration advisory lock: %w", err)
+		}
+		if acquired.Value == nil || *acquired.Value != 1 {
+			return fmt.Errorf("acquire required startup migration advisory lock: lock unavailable")
+		}
+
+		defer func() {
+			releaseCtx, cancel := context.WithTimeout(
+				context.WithoutCancel(ctx),
+				requiredStartupMigrationLockReleaseTimeout,
+			)
+			defer cancel()
+
+			var released struct {
+				Value *int64 `gorm:"column:lock_result"`
+			}
+			if err := conn.WithContext(releaseCtx).Raw(
+				"SELECT RELEASE_LOCK(?) AS lock_result",
+				lockName,
+			).Scan(&released).Error; err != nil {
+				if resultErr != nil && errors.Is(err, driver.ErrBadConn) {
+					return
+				}
+				resultErr = errors.Join(resultErr, fmt.Errorf("release advisory lock for required startup migrations: %w", err))
+				return
+			}
+			if released.Value == nil || *released.Value != 1 {
+				resultErr = errors.Join(resultErr, fmt.Errorf("release advisory lock for required startup migrations: lock was not held"))
+			}
+		}()
+
+		if migrateDB {
+			var tableCount int64
+			if err := conn.Raw(`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tenant_model'`).Scan(&tableCount).Error; err != nil {
+				return fmt.Errorf("inspect tenant_model table before migration bootstrap: %w", err)
+			}
+			if tableCount == 0 {
+				if err := conn.Migrator().CreateTable(&entity.TenantModel{}); err != nil {
+					return fmt.Errorf("create tenant_model table for migration bootstrap: %w", err)
+				}
+			}
+		}
+
+		if err := migrateTenantModelTypeSchema(ctx, conn); err != nil {
+			return fmt.Errorf("migrate tenant_model.model_type: %w", err)
+		}
+		return nil
+	})
+}
+
+func migrateTenantModelTypeSchema(ctx context.Context, db *gorm.DB) error {
+	migrationDB := db.WithContext(ctx)
+
+	var tableCount int64
+	if err := migrationDB.Raw(`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tenant_model'`).Scan(&tableCount).Error; err != nil {
+		return fmt.Errorf("inspect tenant_model table: %w", err)
+	}
+	if tableCount == 0 {
+		return fmt.Errorf("tenant_model table is missing")
+	}
+	if tableCount != 1 {
+		return fmt.Errorf("inspect tenant_model table: expected one table, found %d", tableCount)
+	}
+
+	column, found, err := readTenantModelTypeColumn(migrationDB)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("tenant_model.model_type column is missing")
+	}
+	integerSource := strings.EqualFold(column.DataType, "int")
+	converged := integerSource && strings.EqualFold(column.IsNullable, "NO")
+	if !integerSource && !isTenantModelTypeSourceColumn(column.DataType) {
+		return fmt.Errorf("tenant_model.model_type has unsupported source type %q", column.DataType)
+	}
+
+	var unsupportedCount int64
+	if integerSource {
+		if err := migrationDB.Raw(`
+			SELECT COUNT(*)
+			FROM tenant_model
+			WHERE model_type IS NULL OR model_type < 1 OR model_type > ?
+		`, tenantModelTypeMaskMax).Scan(&unsupportedCount).Error; err != nil {
+			return fmt.Errorf("inspect tenant_model.model_type values: %w", err)
+		}
+	} else if err := migrationDB.Raw(`
+		SELECT COUNT(*)
+		FROM tenant_model
+		WHERE model_type IS NULL
+		   OR TRIM(model_type) = ''
+		   OR (
+			LOWER(TRIM(model_type)) COLLATE utf8mb4_bin NOT IN ('chat', 'embedding', 'asr', 'speech2text', 'vision', 'image2text', 'rerank', 'tts', 'ocr')
+			AND (
+				TRIM(model_type) NOT REGEXP '^[0-9]+$'
+				OR CAST(TRIM(model_type) AS UNSIGNED) < 1
+				OR CAST(TRIM(model_type) AS UNSIGNED) > ?
+			)
+		   )
+	`, tenantModelTypeMaskMax).Scan(&unsupportedCount).Error; err != nil {
+		return fmt.Errorf("inspect tenant_model.model_type values: %w", err)
+	}
+	if unsupportedCount > 0 {
+		return fmt.Errorf("tenant_model.model_type contains %d unsupported value(s)", unsupportedCount)
+	}
+
+	if converged {
+		return nil
+	}
+
+	if !integerSource {
+		if err := migrationDB.Exec(`
+			UPDATE tenant_model
+			SET model_type = CASE LOWER(TRIM(model_type)) COLLATE utf8mb4_bin
+				WHEN 'chat' THEN ?
+				WHEN 'embedding' THEN ?
+				WHEN 'asr' THEN ?
+				WHEN 'speech2text' THEN ?
+				WHEN 'vision' THEN ?
+				WHEN 'image2text' THEN ?
+				WHEN 'rerank' THEN ?
+				WHEN 'tts' THEN ?
+				WHEN 'ocr' THEN ?
+				ELSE TRIM(model_type)
+			END
+		`,
+			legacyTenantModelTypes["chat"],
+			legacyTenantModelTypes["embedding"],
+			legacyTenantModelTypes["asr"],
+			legacyTenantModelTypes["speech2text"],
+			legacyTenantModelTypes["vision"],
+			legacyTenantModelTypes["image2text"],
+			legacyTenantModelTypes["rerank"],
+			legacyTenantModelTypes["tts"],
+			legacyTenantModelTypes["ocr"],
+		).Error; err != nil {
+			return fmt.Errorf("normalize tenant_model.model_type values: %w", err)
+		}
+	}
+
+	if err := migrationDB.Exec("ALTER TABLE tenant_model MODIFY COLUMN model_type INT NOT NULL").Error; err != nil {
+		return fmt.Errorf("modify tenant_model.model_type: %w", err)
+	}
+
+	column, found, err = readTenantModelTypeColumn(migrationDB)
+	if err != nil {
+		return err
+	}
+	if !found || !strings.EqualFold(column.DataType, "int") || !strings.EqualFold(column.IsNullable, "NO") {
+		return fmt.Errorf("tenant_model.model_type postcondition failed: expected INT NOT NULL")
+	}
+
+	unsupportedCount = 0
+	if err := migrationDB.Raw(`
+		SELECT COUNT(*)
+		FROM tenant_model
+		WHERE model_type < 1 OR model_type > ?
+	`, tenantModelTypeMaskMax).Scan(&unsupportedCount).Error; err != nil {
+		return fmt.Errorf("verify tenant_model.model_type values: %w", err)
+	}
+	if unsupportedCount > 0 {
+		return fmt.Errorf("tenant_model.model_type postcondition failed: contains %d unsupported value(s)", unsupportedCount)
+	}
+
+	return nil
+}
+
+func readTenantModelTypeColumn(db *gorm.DB) (tenantModelTypeColumn, bool, error) {
+	var column tenantModelTypeColumn
+	result := db.Raw(`SELECT DATA_TYPE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tenant_model' AND COLUMN_NAME = 'model_type'`).Scan(&column)
+	if result.Error != nil {
+		return tenantModelTypeColumn{}, false, fmt.Errorf("inspect tenant_model.model_type: %w", result.Error)
+	}
+	return column, result.RowsAffected == 1, nil
+}
+
+func isTenantModelTypeSourceColumn(dataType string) bool {
+	switch strings.ToLower(dataType) {
+	case "char", "varchar", "tinytext", "text", "mediumtext", "longtext":
+		return true
+	default:
+		return false
+	}
 }
 
 // migrateTenantLLMPrimaryKey migrates tenant_llm from composite primary key to ID primary key

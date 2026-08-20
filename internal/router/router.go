@@ -279,10 +279,13 @@ func (r *Router) Setup(engine *gin.Engine) {
 			tenants := v1.Group("/tenants")
 			{
 				tenants.GET("", r.tenantHandler.TenantList)
+				tenants.GET("/:tenant_id", r.tenantHandler.GetTenant)
+				tenants.PUT("/:tenant_id", r.tenantHandler.UpdateTenant)
 				tenants.PATCH("/:tenant_id", r.tenantHandler.AcceptTenantInvite)
 				tenants.GET("/:tenant_id/users", r.tenantHandler.ListTenantMembers)
 				tenants.POST("/:tenant_id/users", r.tenantHandler.AddTenantMember)
 				tenants.DELETE("/:tenant_id/users", r.tenantHandler.RemoveTenantMember)
+				tenants.PUT("/:tenant_id/users/:user_id/role", r.tenantHandler.UpdateTenantMemberRole)
 			}
 
 			// Tenant routes (per-tenant resources)

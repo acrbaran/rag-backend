@@ -125,9 +125,19 @@ func (s *Service) StopIngestionTasks(ctx context.Context, tasks []string) ([]*en
 	return s.ingestionTaskSvc.RequestStopMany(ctx, tasks, nil)
 }
 
-// GetUserByToken get user by access token
+// GetUserByToken verifies the signed authorization value returned by Login,
+// then resolves the underlying access token. Raw database tokens are never an
+// accepted admin credential.
 func (s *Service) GetUserByToken(ctx context.Context, token string) (*entity.User, error) {
-	user, err := s.userDAO.GetByAccessToken(ctx, dao.DB, token)
+	secretKey, err := server.GetSecretKey(ctx, redis.Get())
+	if err != nil {
+		return nil, common.ErrInvalidToken
+	}
+	accessToken, err := utility.ExtractAccessToken(token, secretKey)
+	if err != nil {
+		return nil, common.ErrInvalidToken
+	}
+	user, err := s.userDAO.GetByAccessToken(ctx, dao.DB, accessToken)
 	if err != nil {
 		return nil, common.ErrInvalidToken
 	}

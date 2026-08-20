@@ -222,6 +222,10 @@ backup
 
 /target
 
+# Runtime-generated asymmetric key material must never be committed.
+/conf/private.pem
+/conf/public.pem
+
 # Do not include in PR (local dev / build artifacts / working notes)
 ragflow.egg-info/
 uv-aarch64*.tar.gz

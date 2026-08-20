@@ -224,7 +224,8 @@ class FileCommitService(CommonService):
             file_changes: List of dicts:
                 [{"file_id": str, "file_name": str, "operation": "add"|"modify"|"delete"|"rename",
                   "content": str (optional, for add/modify), "content_hash": str (optional),
-                  "old_name": str, "new_name": str (for rename)}]
+                  "old_name": str, "new_name": str (for rename),
+                  "old_parent_id": str, "new_parent_id": str (for move)}]
 
         Returns:
             The created FileCommit instance
@@ -389,6 +390,27 @@ class FileCommitService(CommonService):
                     # Update tree state
                     if file_id in tree_state:
                         tree_state[file_id]["name"] = new_name
+
+                        new_parent_id = change.get("new_parent_id", "")
+                        if new_parent_id:
+                            tree_state[file_id]["parent_id"] = new_parent_id
+
+                elif op == "move":
+                    old_parent_id = change.get("old_parent_id", "")
+                    new_parent_id = change.get("new_parent_id", "")
+                    item["old_location"] = old_parent_id
+                    item["new_location"] = new_parent_id
+
+                    old_name = change.get("old_name", "")
+                    new_name = change.get("new_name", "")
+                    if old_name and new_name:
+                        item["old_name"] = old_name
+                        item["new_name"] = new_name
+
+                    if file_id in tree_state:
+                        tree_state[file_id]["parent_id"] = new_parent_id
+                        if new_name:
+                            tree_state[file_id]["name"] = new_name
 
                 # Insert commit item
                 FileCommitItem(**item).save(force_insert=True)
@@ -570,7 +592,7 @@ class FileCommitService(CommonService):
         """Get uncommitted changes by comparing current File table with latest commit.
 
         Recursively scans all sub-folders under folder_id.
-        Returns list of dicts: [{"file_id", "file_name", "operation": "add"|"modify"|"delete"}]
+        Returns list of dicts containing add/modify/delete/rename/move operations.
         """
         # Get latest commit's tree state
         latest = cls._get_latest_commit(folder_id)
@@ -595,13 +617,45 @@ class FileCommitService(CommonService):
 
             if fid in current_files:
                 live_file = current_files[fid]
+                committed_name = committed_entry.get("name", "")
+                committed_parent_id = committed_entry.get("parent_id", "")
+                live_parent_id = live_file.parent_id or ""
+
+                if live_file.name != committed_name:
+                    rename_change = {
+                        "file_id": fid,
+                        "file_name": live_file.name,
+                        "operation": "rename",
+                        "old_name": committed_name,
+                        "new_name": live_file.name,
+                    }
+                    if live_parent_id != committed_parent_id:
+                        rename_change.update(
+                            {
+                                "old_parent_id": committed_parent_id,
+                                "new_parent_id": live_parent_id,
+                            }
+                        )
+                    changes.append(rename_change)
+
+                if live_parent_id != committed_parent_id:
+                    changes.append(
+                        {
+                            "file_id": fid,
+                            "file_name": live_file.name,
+                            "operation": "move",
+                            "old_parent_id": committed_parent_id,
+                            "new_parent_id": live_parent_id,
+                        }
+                    )
+
                 live_hash = _compute_file_hash(folder_id, fid)
                 committed_hash = committed_entry.get("hash", "")
                 if live_hash and live_hash != committed_hash:
                     changes.append(
                         {
                             "file_id": fid,
-                            "file_name": committed_entry.get("name", ""),
+                            "file_name": live_file.name,
                             "operation": "modify",
                         }
                     )

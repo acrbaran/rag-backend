@@ -11,6 +11,7 @@ import (
 
 	"github.com/elastic/go-elasticsearch/v8"
 
+	"ragflow/internal/common"
 	"ragflow/internal/engine/types"
 )
 
@@ -39,6 +40,59 @@ func TestBuildQueryStringQueryKeepsDocumentFieldsUnchanged(t *testing.T) {
 		t.Fatalf("query_string missing from %#v", query)
 	}
 	assertEqual(t, queryString["fields"], []string{"name^10"})
+}
+
+func TestHybridSearchKeepsLexicalQueryOutOfKNNFilter(t *testing.T) {
+	if err := common.InitLogger("info", common.FileOutput{}, "elasticsearch_test"); err != nil {
+		t.Fatalf("init logger: %v", err)
+	}
+	var searchBody map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewDecoder(r.Body).Decode(&searchBody); err != nil {
+			t.Errorf("decode search request: %v", err)
+		}
+		_, _ = w.Write([]byte(`{"hits":{"total":{"value":0,"relation":"eq"},"hits":[]}}`))
+	}))
+	defer server.Close()
+
+	client, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
+	if err != nil {
+		t.Fatalf("new elasticsearch client: %v", err)
+	}
+	engine := &Engine{client: client}
+	_, err = engine.Search(context.Background(), &types.SearchRequest{
+		IndexNames: []string{"ragflow_tenant"},
+		KbIDs:      []string{"kb-1"},
+		Filter:     map[string]interface{}{"available_int": 1},
+		Limit:      6,
+		MatchExprs: []interface{}{
+			&types.MatchTextExpr{MatchingText: "summarize the document", Fields: []string{"content_ltks"}},
+			&types.MatchDenseExpr{VectorColumnName: "q_3_vec", EmbeddingData: []float64{0.1, 0.2, 0.3}, TopN: 30},
+			&types.FusionExpr{Method: "weighted_sum", FusionParams: map[string]interface{}{"weights": "0.05,0.95"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+
+	query := searchBody["query"].(map[string]interface{})
+	queryBool := query["bool"].(map[string]interface{})
+	if must, ok := queryBool["must"].([]interface{}); !ok || len(must) != 1 {
+		t.Fatalf("lexical query must=%#v, want one query_string clause", queryBool["must"])
+	}
+
+	knn := searchBody["knn"].(map[string]interface{})
+	knnFilter := knn["filter"].(map[string]interface{})
+	knnBool := knnFilter["bool"].(map[string]interface{})
+	if _, leaked := knnBool["must"]; leaked {
+		t.Fatalf("KNN filter leaked lexical must clause: %#v", knnBool)
+	}
+	filters, ok := knnBool["filter"].([]interface{})
+	if !ok || len(filters) != 2 {
+		t.Fatalf("KNN filters=%#v, want kb_id and available_int filters", knnBool["filter"])
+	}
 }
 
 func TestUpdateSingleMemoryMessageWaitsForRefresh(t *testing.T) {

@@ -200,11 +200,34 @@ func (s *FileCommitService) CreateCommit(ctx context.Context, folderID, authorID
 				if entry, ok := treeState[change.FileID]; ok {
 					if entryMap, ok := entry.(map[string]interface{}); ok {
 						entryMap["name"] = change.NewName
+						if change.NewParentID != "" {
+							entryMap["parent_id"] = change.NewParentID
+						}
 					}
 				} else {
 					treeState[change.FileID] = map[string]interface{}{
-						"name":   change.NewName,
-						"status": "1",
+						"name":      change.NewName,
+						"status":    "1",
+						"parent_id": change.NewParentID,
+					}
+				}
+
+			case "move":
+				oldParentID := change.OldParentID
+				newParentID := change.NewParentID
+				item.OldLocation = &oldParentID
+				item.NewLocation = &newParentID
+				if change.OldName != "" && change.NewName != "" {
+					item.OldName = &change.OldName
+					item.NewName = &change.NewName
+				}
+
+				if entry, ok := treeState[change.FileID]; ok {
+					if entryMap, ok := entry.(map[string]interface{}); ok {
+						entryMap["parent_id"] = newParentID
+						if change.NewName != "" {
+							entryMap["name"] = change.NewName
+						}
 					}
 				}
 			}
@@ -580,7 +603,7 @@ func (s *FileCommitService) GetUncommittedChanges(ctx context.Context, folderID 
 	var changes []entity.DiffEntry
 	processed := make(map[string]bool)
 
-	// Check committed files for modifications and deletions
+	// Check committed files for metadata/content modifications and deletions.
 	for fid, committedEntry := range committedFiles {
 		processed[fid] = true
 		if committedEntry["status"] == "0" {
@@ -588,6 +611,22 @@ func (s *FileCommitService) GetUncommittedChanges(ctx context.Context, folderID 
 		}
 
 		if liveFile, ok := liveMap[fid]; ok {
+			for _, metadata := range metadataDiffEntries(committedEntry, liveFile.Name, liveFile.ParentID) {
+				entry := entity.DiffEntry{
+					FileID: fid, FileName: liveFile.Name, Operation: metadata.Operation,
+				}
+				if metadata.Operation == "rename" {
+					oldName, newName := metadata.OldName, metadata.NewName
+					entry.OldName = &oldName
+					entry.NewName = &newName
+				}
+				if metadata.OldParentID != metadata.NewParentID {
+					oldParentID, newParentID := metadata.OldParentID, metadata.NewParentID
+					entry.OldParentID = &oldParentID
+					entry.NewParentID = &newParentID
+				}
+				changes = append(changes, entry)
+			}
 			liveHash := computeLiveFileHash(ctx, folderID, fid, liveFile)
 			committedHash := ""
 			if h, ok := committedEntry["hash"].(string); ok {

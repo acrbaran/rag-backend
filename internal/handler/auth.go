@@ -18,9 +18,11 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"ragflow/internal/common"
+	redisengine "ragflow/internal/engine/redis"
 	"ragflow/internal/entity"
 	"ragflow/internal/server/local"
 	"ragflow/internal/service"
@@ -30,7 +32,21 @@ import (
 
 // AuthHandler auth handler
 type AuthHandler struct {
-	userService userTokenResolver
+	userService     userTokenResolver
+	betaRateLimiter betaRequestRateLimiter
+}
+
+type betaRequestRateLimiter interface {
+	Allow(ctx context.Context, identity string) (bool, error)
+}
+
+type redisBetaRequestRateLimiter struct{}
+
+func (redisBetaRequestRateLimiter) Allow(ctx context.Context, identity string) (bool, error) {
+	digest := sha256.Sum256([]byte(identity))
+	// 60 requests of burst capacity, refilled at one request per second. The
+	// credential itself is never written to Redis or logs.
+	return redisengine.Get().EvalTokenBucketStrict(ctx, fmt.Sprintf("rate:beta:%x", digest[:]), 60, 1)
 }
 
 // userTokenResolver is the subset of UserService the auth
@@ -47,7 +63,8 @@ type userTokenResolver interface {
 // NewAuthHandler create auth handler
 func NewAuthHandler() *AuthHandler {
 	return &AuthHandler{
-		userService: service.NewUserService(),
+		userService:     service.NewUserService(),
+		betaRateLimiter: redisBetaRequestRateLimiter{},
 	}
 }
 
@@ -85,6 +102,19 @@ func (h *AuthHandler) BetaAuthMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
+		if h.betaRateLimiter != nil {
+			allowed, err := h.betaRateLimiter.Allow(ctx, auth)
+			if err != nil {
+				common.ResponseWithHttpCodeData(c, http.StatusServiceUnavailable, common.CodeServerError, nil, "Public API rate limiter unavailable")
+				c.Abort()
+				return
+			}
+			if !allowed {
+				common.ResponseWithHttpCodeData(c, http.StatusTooManyRequests, common.ErrorCode(http.StatusTooManyRequests), nil, "Public API rate limit exceeded")
+				c.Abort()
+				return
+			}
+		}
 		// AUTH_JWT
 		if u, code, err := h.userService.GetUserByToken(ctx, auth); err == nil && code == common.CodeSuccess {
 			c.Set("user", u)
@@ -113,8 +143,9 @@ func (h *AuthHandler) BetaAuthMiddleware() gin.HandlerFunc {
 	}
 }
 
-// AuthMiddleware JWT auth middleware
-// Validates that the user is authenticated and is a superuser (admin)
+// AuthMiddleware validates a signed user session (or API token). Platform
+// superusers may also use their own tenant-scoped product routes; individual
+// services still enforce membership, ownership and IDOR boundaries.
 func (h *AuthHandler) AuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ctx := c.Request.Context()
@@ -137,12 +168,6 @@ func (h *AuthHandler) AuthMiddleware() gin.HandlerFunc {
 				return
 			}
 			authViaAPIToken = true
-		}
-
-		if user.IsSuperuser != nil && *user.IsSuperuser {
-			common.ResponseWithHttpCodeData(c, http.StatusForbidden, common.CodeForbidden, nil, "Super user shouldn't access the URL")
-			c.Abort()
-			return
 		}
 
 		if !local.IsAdminAvailable() {

@@ -3,9 +3,11 @@ package dataset
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -162,48 +164,96 @@ func datasetStringSlice(value interface{}) []string {
 	return nil
 }
 
+var datasetVectorFieldPattern = regexp.MustCompile(`^[qu]_(\d+)_vec$`)
+
 func datasetGuessVecField(src map[string]interface{}) string {
-	var f64, f32 string
+	questionFields := make([]string, 0, 1)
+	fallbackFields := make([]string, 0, 1)
 	for k, v := range src {
-		if !strings.HasPrefix(k, "q_") && !strings.HasPrefix(k, "u_") {
+		matches := datasetVectorFieldPattern.FindStringSubmatch(k)
+		if len(matches) != 2 {
 			continue
 		}
-		switch v.(type) {
-		case []float64:
-			f64 = k
-		case string:
-			f32 = k
+		dimension, err := strconv.Atoi(matches[1])
+		vector := datasetAsFloatVec(v)
+		if err != nil || dimension <= 0 || len(vector) == 0 || dimension != len(vector) {
+			continue
+		}
+		if strings.HasPrefix(k, "q_") {
+			questionFields = append(questionFields, k)
+		} else {
+			fallbackFields = append(fallbackFields, k)
 		}
 	}
-	if f64 != "" {
-		return f64
+	if len(questionFields) == 1 {
+		return questionFields[0]
 	}
-	return f32
+	if len(questionFields) > 1 || len(fallbackFields) != 1 {
+		return ""
+	}
+	return fallbackFields[0]
 }
 
 func datasetAsFloatVec(v interface{}) []float64 {
+	var vec []float64
 	switch val := v.(type) {
+	case string:
+		parts := strings.Split(val, "\t")
+		vec = make([]float64, len(parts))
+		for i, part := range parts {
+			n, err := strconv.ParseFloat(strings.TrimSpace(part), 64)
+			if err != nil {
+				return nil
+			}
+			vec[i] = n
+		}
 	case []float64:
-		return val
+		vec = append([]float64(nil), val...)
+	case []float32:
+		vec = make([]float64, len(val))
+		for i, n := range val {
+			vec[i] = float64(n)
+		}
 	case []interface{}:
-		vec := make([]float64, 0, len(val))
-		for _, item := range val {
+		vec = make([]float64, len(val))
+		for i, item := range val {
 			switch n := item.(type) {
 			case float64:
-				vec = append(vec, n)
+				vec[i] = n
+			case float32:
+				vec[i] = float64(n)
 			case int:
-				vec = append(vec, float64(n))
+				vec[i] = float64(n)
 			case int64:
-				vec = append(vec, float64(n))
+				vec[i] = float64(n)
 			case json.Number:
-				if f, err := n.Float64(); err == nil {
-					vec = append(vec, f)
+				f, err := n.Float64()
+				if err != nil {
+					return nil
 				}
+				vec[i] = f
+			case string:
+				f, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
+				if err != nil {
+					return nil
+				}
+				vec[i] = f
+			default:
+				return nil
 			}
 		}
-		return vec
+	default:
+		return nil
 	}
-	return nil
+	if len(vec) == 0 {
+		return nil
+	}
+	for _, n := range vec {
+		if math.IsNaN(n) || math.IsInf(n, 0) {
+			return nil
+		}
+	}
+	return vec
 }
 
 func datasetCosSim(a, b []float64) float64 {
@@ -240,8 +290,27 @@ func datasetEncodeEmbedding(ctx context.Context, embeddingModel *modelModule.Emb
 	if err != nil {
 		return nil, err
 	}
+	if len(embeddings) != len(cleaned) {
+		return nil, fmt.Errorf(
+			"embedding response count %d does not match input count %d",
+			len(embeddings),
+			len(cleaned),
+		)
+	}
 	vectors := make([][]float64, len(embeddings))
 	for i, embedding := range embeddings {
+		if len(embedding.Embedding) == 0 {
+			return nil, fmt.Errorf("empty embedding vector at index %d", i)
+		}
+		for j, value := range embedding.Embedding {
+			if math.IsNaN(value) || math.IsInf(value, 0) {
+				return nil, fmt.Errorf(
+					"non-finite embedding value at vector %d index %d",
+					i,
+					j,
+				)
+			}
+		}
 		vectors[i] = embedding.Embedding
 	}
 	return vectors, nil
@@ -304,9 +373,9 @@ func datasetRoundFloat(value float64, places int) float64 {
 }
 
 func datasetChunkID(chunk map[string]interface{}) string {
-	if id, ok := chunk["chunk_id"]; ok {
-		if s, ok := id.(string); ok {
-			return s
+	for _, field := range []string{"chunk_id", "id", "_id"} {
+		if id, ok := chunk[field].(string); ok && id != "" {
+			return id
 		}
 	}
 	return ""

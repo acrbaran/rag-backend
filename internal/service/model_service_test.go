@@ -2,8 +2,13 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/glebarez/sqlite"
@@ -13,21 +18,1394 @@ import (
 	"ragflow/internal/dao"
 	"ragflow/internal/entity"
 	modelModule "ragflow/internal/entity/models"
+	"ragflow/internal/utility"
 )
 
 type remoteModelProbeDriver struct {
 	*modelModule.DummyModel
-	remoteModels []modelModule.ListModelResponse
-	embedCalls   int
+	newInstanceResult   modelModule.ModelDriver
+	remoteModels        []modelModule.ListModelResponse
+	listErr             error
+	connectionErr       error
+	listCalls           int
+	embedCalls          int
+	connectionCalls     int
+	connectionAPIConfig modelModule.APIConfig
+}
+
+func (d *remoteModelProbeDriver) NewInstance(
+	map[string]string,
+) modelModule.ModelDriver {
+	return d.newInstanceResult
 }
 
 func (d *remoteModelProbeDriver) ListModels(context.Context, *modelModule.APIConfig) ([]modelModule.ListModelResponse, error) {
-	return d.remoteModels, nil
+	d.listCalls++
+	return d.remoteModels, d.listErr
 }
 
 func (d *remoteModelProbeDriver) Embed(context.Context, *string, []string, *modelModule.APIConfig, *modelModule.EmbeddingConfig, *common.ModelUsage) ([]modelModule.EmbeddingData, error) {
 	d.embedCalls++
 	return nil, nil
+}
+
+func (d *remoteModelProbeDriver) CheckConnection(_ context.Context, apiConfig *modelModule.APIConfig) error {
+	d.connectionCalls++
+	if apiConfig != nil {
+		d.connectionAPIConfig = *apiConfig
+	}
+	return d.connectionErr
+}
+
+func installModelServiceProbeDriver(
+	t *testing.T,
+	providerName string,
+	probe modelModule.ModelDriver,
+) {
+	t.Helper()
+	providerInfo := dao.GetModelProviderManager().FindProvider(providerName)
+	if providerInfo == nil {
+		t.Fatalf("%s provider metadata missing", providerName)
+	}
+	originalDriver := providerInfo.ModelDriver
+	providerInfo.ModelDriver = probe
+	t.Cleanup(func() { providerInfo.ModelDriver = originalDriver })
+}
+
+func TestNormalizeModelNameAgainstRemoteCatalogRejectsMissingScope(t *testing.T) {
+	service := NewModelProviderService()
+	provider := &entity.TenantModelProvider{ProviderName: "OpenAI"}
+	instance := &entity.TenantModelInstance{Extra: "{}"}
+	tests := []struct {
+		name     string
+		provider *entity.TenantModelProvider
+		instance *entity.TenantModelInstance
+		wantErr  string
+	}{
+		{
+			name:     "missing provider",
+			instance: instance,
+			wantErr:  "provider is required",
+		},
+		{
+			name:     "missing instance",
+			provider: provider,
+			wantErr:  "instance is required",
+		},
+		{
+			name:     "missing provider driver",
+			provider: &entity.TenantModelProvider{ProviderName: "missing-provider"},
+			instance: instance,
+			wantErr:  "driver not found",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, changed, err := service.normalizeModelNameAgainstRemoteCatalog(
+				t.Context(),
+				test.provider,
+				test.instance,
+				"remote-model@openai",
+			)
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf(
+					"normalizeModelNameAgainstRemoteCatalog() error = %v, want %q",
+					err,
+					test.wantErr,
+				)
+			}
+			if got != "remote-model@openai" || changed {
+				t.Fatalf("result = (%q, %v), want unchanged model", got, changed)
+			}
+		})
+	}
+}
+
+func TestNormalizeModelNameAgainstRemoteCatalogRejectsUnsupportedBaseURL(t *testing.T) {
+	service := NewModelProviderService()
+	provider := &entity.TenantModelProvider{ProviderName: "OpenAI"}
+	instance := &entity.TenantModelInstance{
+		Extra: `{"base_url":"https://models.invalid"}`,
+	}
+	probe := &remoteModelProbeDriver{
+		DummyModel: modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+	}
+	providerInfo := dao.GetModelProviderManager().FindProvider(provider.ProviderName)
+	if providerInfo == nil {
+		t.Fatal("OpenAI provider metadata missing")
+	}
+	originalDriver := providerInfo.ModelDriver
+	providerInfo.ModelDriver = probe
+	t.Cleanup(func() { providerInfo.ModelDriver = originalDriver })
+
+	got, changed, err := service.normalizeModelNameAgainstRemoteCatalog(
+		t.Context(),
+		provider,
+		instance,
+		"remote-model@openai",
+	)
+	if err == nil || !strings.Contains(err.Error(), "does not support custom base_url") {
+		t.Fatalf(
+			"normalizeModelNameAgainstRemoteCatalog() error = %v, want base URL error",
+			err,
+		)
+	}
+	if got != "remote-model@openai" || changed {
+		t.Fatalf("result = (%q, %v), want unchanged model", got, changed)
+	}
+}
+
+func TestNormalizeModelNameAgainstRemoteCatalogRejectsInvalidMetadata(t *testing.T) {
+	service := NewModelProviderService()
+	provider := &entity.TenantModelProvider{ProviderName: "OpenAI"}
+	instance := &entity.TenantModelInstance{Extra: "{"}
+
+	got, changed, err := service.normalizeModelNameAgainstRemoteCatalog(
+		t.Context(),
+		provider,
+		instance,
+		"remote-model@openai",
+	)
+	if err == nil || !strings.Contains(err.Error(), "invalid instance metadata") {
+		t.Fatalf("normalizeModelNameAgainstRemoteCatalog() error = %v, want invalid metadata error", err)
+	}
+	if got != "remote-model@openai" || changed {
+		t.Fatalf("result = (%q, %v), want unchanged model", got, changed)
+	}
+}
+
+func TestNormalizeModelNameAgainstRemoteCatalogRejectsListFailure(t *testing.T) {
+	service := NewModelProviderService()
+	provider := &entity.TenantModelProvider{ProviderName: "OpenAI"}
+	instance := &entity.TenantModelInstance{Extra: "{}"}
+	probe := &remoteModelProbeDriver{
+		DummyModel: modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+		listErr:    errors.New("catalog unavailable"),
+	}
+	probe.newInstanceResult = probe
+	providerInfo := dao.GetModelProviderManager().FindProvider(provider.ProviderName)
+	if providerInfo == nil {
+		t.Fatal("OpenAI provider metadata missing")
+	}
+	originalDriver := providerInfo.ModelDriver
+	providerInfo.ModelDriver = probe
+	t.Cleanup(func() { providerInfo.ModelDriver = originalDriver })
+
+	got, changed, err := service.normalizeModelNameAgainstRemoteCatalog(
+		t.Context(),
+		provider,
+		instance,
+		"remote-model@openai",
+	)
+	if err == nil || !strings.Contains(err.Error(), "catalog unavailable") {
+		t.Fatalf("normalizeModelNameAgainstRemoteCatalog() error = %v, want catalog error", err)
+	}
+	if got != "remote-model@openai" || changed {
+		t.Fatalf("result = (%q, %v), want unchanged model", got, changed)
+	}
+}
+
+func TestNormalizeModelNameAgainstRemoteCatalogRejectsEmptyCatalog(t *testing.T) {
+	service := NewModelProviderService()
+	provider := &entity.TenantModelProvider{ProviderName: "OpenAI"}
+	instance := &entity.TenantModelInstance{Extra: "{}"}
+	probe := &remoteModelProbeDriver{
+		DummyModel: modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+		remoteModels: []modelModule.ListModelResponse{
+			{Name: "  "},
+		},
+	}
+	probe.newInstanceResult = probe
+	providerInfo := dao.GetModelProviderManager().FindProvider(provider.ProviderName)
+	if providerInfo == nil {
+		t.Fatal("OpenAI provider metadata missing")
+	}
+	originalDriver := providerInfo.ModelDriver
+	providerInfo.ModelDriver = probe
+	t.Cleanup(func() { providerInfo.ModelDriver = originalDriver })
+
+	got, changed, err := service.normalizeModelNameAgainstRemoteCatalog(
+		t.Context(),
+		provider,
+		instance,
+		"remote-model@openai",
+	)
+	if err == nil || !strings.Contains(err.Error(), "no usable models") {
+		t.Fatalf("normalizeModelNameAgainstRemoteCatalog() error = %v, want empty catalog error", err)
+	}
+	if got != "remote-model@openai" || changed {
+		t.Fatalf("result = (%q, %v), want unchanged model", got, changed)
+	}
+}
+
+func TestNormalizeModelNameAgainstRemoteCatalogRejectsUnlistedModel(t *testing.T) {
+	service := NewModelProviderService()
+	provider := &entity.TenantModelProvider{ProviderName: "OpenAI"}
+	instance := &entity.TenantModelInstance{Extra: "{}"}
+	probe := &remoteModelProbeDriver{
+		DummyModel: modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+		remoteModels: []modelModule.ListModelResponse{{
+			Name: "different-model",
+		}},
+	}
+	probe.newInstanceResult = probe
+	providerInfo := dao.GetModelProviderManager().FindProvider(provider.ProviderName)
+	if providerInfo == nil {
+		t.Fatal("OpenAI provider metadata missing")
+	}
+	originalDriver := providerInfo.ModelDriver
+	providerInfo.ModelDriver = probe
+	t.Cleanup(func() { providerInfo.ModelDriver = originalDriver })
+
+	got, changed, err := service.normalizeModelNameAgainstRemoteCatalog(
+		t.Context(),
+		provider,
+		instance,
+		"remote-model@openai",
+	)
+	if err == nil ||
+		!errors.Is(err, errRemoteModelNotFound) ||
+		!strings.Contains(err.Error(), "not found in remote model catalog") {
+		t.Fatalf("normalizeModelNameAgainstRemoteCatalog() error = %v, want unlisted model error", err)
+	}
+	if got != "remote-model@openai" || changed {
+		t.Fatalf("result = (%q, %v), want unchanged model", got, changed)
+	}
+}
+
+func TestAddModelClassifiesUnlistedRemoteModelAsDataError(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	probe := &remoteModelProbeDriver{
+		DummyModel: modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+		remoteModels: []modelModule.ListModelResponse{{
+			Name: "different-model",
+		}},
+	}
+	probe.newInstanceResult = probe
+	providerInfo := dao.GetModelProviderManager().FindProvider("OpenAI")
+	if providerInfo == nil {
+		t.Fatal("OpenAI provider metadata missing")
+	}
+	originalDriver := providerInfo.ModelDriver
+	providerInfo.ModelDriver = probe
+	t.Cleanup(func() { providerInfo.ModelDriver = originalDriver })
+
+	code, err := NewModelProviderService().AddModel(
+		t.Context(),
+		&AddModelRequest{
+			ProviderName: "OpenAI",
+			InstanceName: "default",
+			ModelName:    "remote-model@openai",
+			ModelTypes:   []string{"embedding"},
+		},
+		"user-1",
+	)
+	if err == nil || !strings.Contains(err.Error(), "not found in remote model catalog") {
+		t.Fatalf("AddModel() error = %v, want unlisted model error", err)
+	}
+	if code != common.CodeDataError {
+		t.Fatalf("code = %v, want %v", code, common.CodeDataError)
+	}
+}
+
+func TestNormalizeCreateInstanceModelsUsesOneCatalogSnapshot(t *testing.T) {
+	service := NewModelProviderService()
+	provider := &entity.TenantModelProvider{ProviderName: "OpenAI"}
+	instance := &entity.TenantModelInstance{Extra: "{}"}
+	probe := &remoteModelProbeDriver{
+		DummyModel: modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+		remoteModels: []modelModule.ListModelResponse{
+			{Name: "model-a"},
+			{Name: "model-b"},
+		},
+	}
+	probe.newInstanceResult = probe
+	providerInfo := dao.GetModelProviderManager().FindProvider(provider.ProviderName)
+	if providerInfo == nil {
+		t.Fatal("OpenAI provider metadata missing")
+	}
+	originalDriver := providerInfo.ModelDriver
+	providerInfo.ModelDriver = probe
+	t.Cleanup(func() { providerInfo.ModelDriver = originalDriver })
+
+	normalized, err := service.normalizeCreateInstanceModels(
+		t.Context(),
+		provider,
+		instance,
+		[]CreateInstanceModelInfo{
+			{ModelName: "model-a@openai"},
+			{ModelName: "model-b@openai"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("normalizeCreateInstanceModels() error = %v", err)
+	}
+	if probe.listCalls != 1 {
+		t.Fatalf("ListModels calls = %d, want 1", probe.listCalls)
+	}
+	if len(normalized) != 2 ||
+		normalized[0].ModelName != "model-a" ||
+		normalized[1].ModelName != "model-b" {
+		t.Fatalf("normalized models = %#v", normalized)
+	}
+}
+
+func TestAddModelPreservesNonLegacyAtSignWithoutCatalogLookup(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	probe := &remoteModelProbeDriver{
+		DummyModel: modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+		listErr:    errors.New("catalog must not be called"),
+	}
+	installModelServiceProbeDriver(t, "OpenAI", probe)
+
+	code, err := NewModelProviderService().AddModel(
+		t.Context(),
+		&AddModelRequest{
+			ProviderName: "OpenAI",
+			InstanceName: "default",
+			ModelName:    "team@model",
+			ModelTypes:   []string{"embedding"},
+		},
+		"user-1",
+	)
+	if err != nil {
+		t.Fatalf("AddModel() error = %v", err)
+	}
+	if code != common.CodeSuccess {
+		t.Fatalf("code = %v, want %v", code, common.CodeSuccess)
+	}
+	if probe.listCalls != 0 {
+		t.Fatalf("ListModels calls = %d, want 0", probe.listCalls)
+	}
+
+	var created entity.TenantModel
+	if err := db.Where(
+		"provider_id = ? AND instance_id = ? AND model_name = ?",
+		"provider-1",
+		"instance-1",
+		"team@model",
+	).Take(&created).Error; err != nil {
+		t.Fatalf("reload created model: %v", err)
+	}
+}
+
+func TestAddModelToInstanceRejectsRemoteCatalogFailure(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	probe := &remoteModelProbeDriver{
+		DummyModel: modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+		listErr:    errors.New("catalog unavailable"),
+	}
+	probe.newInstanceResult = probe
+	providerInfo := dao.GetModelProviderManager().FindProvider("OpenAI")
+	if providerInfo == nil {
+		t.Fatal("OpenAI provider metadata missing")
+	}
+	originalDriver := providerInfo.ModelDriver
+	providerInfo.ModelDriver = probe
+	t.Cleanup(func() { providerInfo.ModelDriver = originalDriver })
+
+	err := NewModelProviderService().addModelToInstance(
+		t.Context(),
+		"tenant-1",
+		"OpenAI",
+		"default",
+		CreateInstanceModelInfo{
+			ModelName:  "remote-model@openai",
+			ModelTypes: []string{"embedding"},
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "catalog unavailable") {
+		t.Fatalf("addModelToInstance() error = %v, want catalog error", err)
+	}
+
+	var count int64
+	if err := db.Model(&entity.TenantModel{}).
+		Where("model_name = ?", "remote-model@openai").
+		Count(&count).Error; err != nil {
+		t.Fatalf("failed to count tenant models: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("created model count = %d, want 0", count)
+	}
+}
+
+func TestAddModelChecksDuplicateAndCreatesInsideTransaction(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+
+	duplicateLookupSeen := false
+	duplicateLookupInTransaction := false
+	if err := db.Callback().Query().After("gorm:query").Register(
+		"observe_add_model_duplicate_lookup",
+		func(tx *gorm.DB) {
+			if tx.Statement.Table != "tenant_model" ||
+				!statementHasStringVariable(tx, "atomic-model") {
+				return
+			}
+			duplicateLookupSeen = true
+			_, duplicateLookupInTransaction = tx.Statement.ConnPool.(*sql.Tx)
+		},
+	); err != nil {
+		t.Fatalf("register duplicate lookup observer: %v", err)
+	}
+
+	createSeen := false
+	createInTransaction := false
+	if err := db.Callback().Create().Before("gorm:create").Register(
+		"observe_add_model_create",
+		func(tx *gorm.DB) {
+			model, ok := tx.Statement.Dest.(*entity.TenantModel)
+			if !ok || model.ModelName != "atomic-model" {
+				return
+			}
+			createSeen = true
+			_, createInTransaction = tx.Statement.ConnPool.(*sql.Tx)
+		},
+	); err != nil {
+		t.Fatalf("register create observer: %v", err)
+	}
+
+	code, err := NewModelProviderService().AddModel(
+		t.Context(),
+		&AddModelRequest{
+			ProviderName: "OpenAI",
+			InstanceName: "default",
+			ModelName:    "atomic-model",
+			ModelTypes:   []string{"chat"},
+		},
+		"user-1",
+	)
+	if err != nil {
+		t.Fatalf("AddModel() error = %v", err)
+	}
+	if code != common.CodeSuccess {
+		t.Fatalf("code = %v, want %v", code, common.CodeSuccess)
+	}
+	if !duplicateLookupSeen || !duplicateLookupInTransaction {
+		t.Fatalf(
+			"duplicate lookup = (seen=%v, transaction=%v), want true, true",
+			duplicateLookupSeen,
+			duplicateLookupInTransaction,
+		)
+	}
+	if !createSeen || !createInTransaction {
+		t.Fatalf(
+			"create = (seen=%v, transaction=%v), want true, true",
+			createSeen,
+			createInTransaction,
+		)
+	}
+}
+
+func TestAddModelRejectsExistingModelAsConflict(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+
+	code, err := NewModelProviderService().AddModel(
+		t.Context(),
+		&AddModelRequest{
+			ProviderName: "OpenAI",
+			InstanceName: "default",
+			ModelName:    "gpt-test",
+			ModelTypes:   []string{"chat"},
+		},
+		"user-1",
+	)
+	if err == nil || !errors.Is(err, errDuplicateExistingModel) {
+		t.Fatalf("AddModel() error = %v, want duplicate existing model error", err)
+	}
+	if code != common.CodeConflict {
+		t.Fatalf("code = %v, want %v", code, common.CodeConflict)
+	}
+
+	var count int64
+	if err := db.Model(&entity.TenantModel{}).
+		Where(
+			"provider_id = ? AND instance_id = ? AND model_name = ?",
+			"provider-1",
+			"instance-1",
+			"gpt-test",
+		).
+		Count(&count).Error; err != nil {
+		t.Fatalf("count existing model rows: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("existing model count = %d, want 1", count)
+	}
+}
+
+func statementHasStringVariable(tx *gorm.DB, want string) bool {
+	for _, variable := range tx.Statement.Vars {
+		if got, ok := variable.(string); ok && got == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestAddModelRejectsRemoteCatalogFailure(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	probe := &remoteModelProbeDriver{
+		DummyModel: modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+		listErr:    errors.New("catalog unavailable"),
+	}
+	probe.newInstanceResult = probe
+	providerInfo := dao.GetModelProviderManager().FindProvider("OpenAI")
+	if providerInfo == nil {
+		t.Fatal("OpenAI provider metadata missing")
+	}
+	originalDriver := providerInfo.ModelDriver
+	providerInfo.ModelDriver = probe
+	t.Cleanup(func() { providerInfo.ModelDriver = originalDriver })
+
+	code, err := NewModelProviderService().AddModel(
+		t.Context(),
+		&AddModelRequest{
+			ProviderName: "OpenAI",
+			InstanceName: "default",
+			ModelName:    "remote-model@openai",
+			ModelTypes:   []string{"embedding"},
+		},
+		"user-1",
+	)
+	if err == nil || !strings.Contains(err.Error(), "catalog unavailable") {
+		t.Fatalf("AddModel() error = %v, want catalog error", err)
+	}
+	if code != common.CodeServerError {
+		t.Fatalf("code = %v, want %v", code, common.CodeServerError)
+	}
+
+	var count int64
+	if err := db.Model(&entity.TenantModel{}).
+		Where("model_name = ?", "remote-model@openai").
+		Count(&count).Error; err != nil {
+		t.Fatalf("failed to count tenant models: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("created model count = %d, want 0", count)
+	}
+}
+
+func TestCreateProviderInstanceRejectsFailedVerificationWithoutMutation(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	probe := &remoteModelProbeDriver{
+		DummyModel:    modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+		connectionErr: errors.New("credential rejected"),
+	}
+	installModelServiceProbeDriver(t, "OpenAI", probe)
+
+	code, err := NewModelProviderService().CreateProviderInstance(
+		t.Context(),
+		"OpenAI",
+		"unverified-instance",
+		"invalid-key",
+		"",
+		"",
+		"user-1",
+		[]CreateInstanceModelInfo{{
+			ModelName:  "new-model",
+			ModelTypes: []string{"embedding"},
+		}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "credential rejected") {
+		t.Fatalf("CreateProviderInstance() error = %v, want verification error", err)
+	}
+	if code == common.CodeSuccess {
+		t.Fatalf("code = %v, want non-success", code)
+	}
+	if probe.connectionCalls != 1 {
+		t.Fatalf("CheckConnection calls = %d, want 1", probe.connectionCalls)
+	}
+
+	var instanceCount int64
+	if err := db.Model(&entity.TenantModelInstance{}).
+		Where("instance_name = ?", "unverified-instance").
+		Count(&instanceCount).Error; err != nil {
+		t.Fatalf("count provider instances: %v", err)
+	}
+	if instanceCount != 0 {
+		t.Fatalf("created instance count = %d, want 0", instanceCount)
+	}
+	var modelCount int64
+	if err := db.Model(&entity.TenantModel{}).
+		Where("model_name = ?", "new-model").
+		Count(&modelCount).Error; err != nil {
+		t.Fatalf("count provider models: %v", err)
+	}
+	if modelCount != 0 {
+		t.Fatalf("created model count = %d, want 0", modelCount)
+	}
+}
+
+func TestCreateProviderInstanceRejectsFailedVerificationWithoutModels(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	probe := &remoteModelProbeDriver{
+		DummyModel:    modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+		connectionErr: errors.New("credential rejected"),
+	}
+	installModelServiceProbeDriver(t, "OpenAI", probe)
+
+	code, err := NewModelProviderService().CreateProviderInstance(
+		t.Context(),
+		"OpenAI",
+		"unverified-empty-instance",
+		"invalid-key",
+		"",
+		"",
+		"user-1",
+		nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "credential rejected") {
+		t.Fatalf("CreateProviderInstance() error = %v, want verification error", err)
+	}
+	if code == common.CodeSuccess {
+		t.Fatalf("code = %v, want non-success", code)
+	}
+	if probe.connectionCalls != 1 {
+		t.Fatalf("CheckConnection calls = %d, want 1", probe.connectionCalls)
+	}
+
+	var instanceCount int64
+	if err := db.Model(&entity.TenantModelInstance{}).
+		Where("instance_name = ?", "unverified-empty-instance").
+		Count(&instanceCount).Error; err != nil {
+		t.Fatalf("count provider instances: %v", err)
+	}
+	if instanceCount != 0 {
+		t.Fatalf("created instance count = %d, want 0", instanceCount)
+	}
+}
+
+func TestAlterProviderInstanceRejectsFailedVerificationWithoutMutation(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	probe := &remoteModelProbeDriver{
+		DummyModel:    modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+		connectionErr: errors.New("credential rejected"),
+	}
+	installModelServiceProbeDriver(t, "OpenAI", probe)
+
+	code, err := NewModelProviderService().AlterProviderInstance(
+		t.Context(),
+		"user-1",
+		"OpenAI",
+		"instance-1",
+		"renamed-after-verification",
+		"invalid-key",
+		"",
+		"new-region",
+		[]CreateInstanceModelInfo{{
+			ModelName:  "replacement-model",
+			ModelTypes: []string{"embedding"},
+		}},
+		true,
+	)
+	if err == nil || !strings.Contains(err.Error(), "credential rejected") {
+		t.Fatalf("AlterProviderInstance() error = %v, want verification error", err)
+	}
+	if code == common.CodeSuccess {
+		t.Fatalf("code = %v, want non-success", code)
+	}
+	if probe.connectionCalls != 1 {
+		t.Fatalf("CheckConnection calls = %d, want 1", probe.connectionCalls)
+	}
+
+	var instance entity.TenantModelInstance
+	if err := db.Where("id = ?", "instance-1").Take(&instance).Error; err != nil {
+		t.Fatalf("reload instance: %v", err)
+	}
+	if instance.InstanceName != "default" ||
+		instance.APIKey != "sk-test" ||
+		instance.Extra != "{}" {
+		t.Fatalf("instance after failure = %#v, want original values", instance)
+	}
+	var models []entity.TenantModel
+	if err := db.Where("instance_id = ?", "instance-1").Order("id").Find(&models).Error; err != nil {
+		t.Fatalf("reload models: %v", err)
+	}
+	if len(models) != 1 ||
+		models[0].ID != "model-1" ||
+		models[0].ModelName != "gpt-test" ||
+		models[0].ModelType != int(entity.ModelTypeChat) {
+		t.Fatalf("models after failure = %#v, want original model", models)
+	}
+}
+
+func TestAlterProviderInstanceVerifiesWithRetainedEndpointMetadata(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	if err := db.Model(&entity.TenantModelInstance{}).
+		Where("id = ?", "instance-1").
+		Update("extra", `{"base_url":"https://models.example.test/v1","region":"stored-region"}`).
+		Error; err != nil {
+		t.Fatalf("seed instance endpoint metadata: %v", err)
+	}
+	probe := &remoteModelProbeDriver{
+		DummyModel: modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+	}
+	installModelServiceProbeDriver(t, "OpenAI", probe)
+
+	code, err := NewModelProviderService().AlterProviderInstance(
+		t.Context(),
+		"user-1",
+		"OpenAI",
+		"instance-1",
+		"",
+		"new-key",
+		"",
+		"",
+		[]CreateInstanceModelInfo{{
+			ModelName:  "gpt-test",
+			ModelTypes: []string{"chat"},
+		}},
+		true,
+	)
+	if err != nil {
+		t.Fatalf("AlterProviderInstance() error = %v", err)
+	}
+	if code != common.CodeSuccess {
+		t.Fatalf("code = %v, want %v", code, common.CodeSuccess)
+	}
+	if probe.connectionCalls != 1 {
+		t.Fatalf("CheckConnection calls = %d, want 1", probe.connectionCalls)
+	}
+	if probe.connectionAPIConfig.BaseURL == nil ||
+		*probe.connectionAPIConfig.BaseURL != "https://models.example.test/v1" {
+		t.Fatalf(
+			"verified base URL = %v, want retained endpoint",
+			probe.connectionAPIConfig.BaseURL,
+		)
+	}
+	if probe.connectionAPIConfig.Region == nil ||
+		*probe.connectionAPIConfig.Region != "stored-region" {
+		t.Fatalf(
+			"verified region = %v, want retained region",
+			probe.connectionAPIConfig.Region,
+		)
+	}
+}
+
+func TestCreateProviderInstanceRollsBackCatalogFailure(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	probe := &remoteModelProbeDriver{
+		DummyModel: modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+		listErr:    errors.New("catalog unavailable"),
+	}
+	probe.newInstanceResult = probe
+	providerInfo := dao.GetModelProviderManager().FindProvider("OpenAI")
+	if providerInfo == nil {
+		t.Fatal("OpenAI provider metadata missing")
+	}
+	originalDriver := providerInfo.ModelDriver
+	providerInfo.ModelDriver = probe
+	t.Cleanup(func() { providerInfo.ModelDriver = originalDriver })
+
+	code, err := NewModelProviderService().CreateProviderInstance(
+		t.Context(),
+		"OpenAI",
+		"new-instance",
+		"test-key",
+		"",
+		"",
+		"user-1",
+		[]CreateInstanceModelInfo{{
+			ModelName:  "remote-model@openai",
+			ModelTypes: []string{"embedding"},
+		}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "catalog unavailable") {
+		t.Fatalf("CreateProviderInstance() error = %v, want catalog error", err)
+	}
+	if code != common.CodeServerError {
+		t.Fatalf("code = %v, want %v", code, common.CodeServerError)
+	}
+
+	var instanceCount int64
+	if err := db.Model(&entity.TenantModelInstance{}).
+		Where("instance_name = ?", "new-instance").
+		Count(&instanceCount).Error; err != nil {
+		t.Fatalf("count provider instances: %v", err)
+	}
+	if instanceCount != 0 {
+		t.Fatalf("created instance count = %d, want 0", instanceCount)
+	}
+}
+
+func TestCreateProviderInstanceRollsBackEarlierModelsOnCatalogFailure(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	probe := &remoteModelProbeDriver{
+		DummyModel: modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+		listErr:    errors.New("catalog unavailable"),
+	}
+	probe.newInstanceResult = probe
+	providerInfo := dao.GetModelProviderManager().FindProvider("OpenAI")
+	if providerInfo == nil {
+		t.Fatal("OpenAI provider metadata missing")
+	}
+	originalDriver := providerInfo.ModelDriver
+	providerInfo.ModelDriver = probe
+	t.Cleanup(func() { providerInfo.ModelDriver = originalDriver })
+
+	code, err := NewModelProviderService().CreateProviderInstance(
+		t.Context(),
+		"OpenAI",
+		"new-instance",
+		"test-key",
+		"",
+		"",
+		"user-1",
+		[]CreateInstanceModelInfo{
+			{ModelName: "plain-model", ModelTypes: []string{"chat"}},
+			{ModelName: "remote-model@openai", ModelTypes: []string{"embedding"}},
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "catalog unavailable") {
+		t.Fatalf("CreateProviderInstance() error = %v, want catalog error", err)
+	}
+	if code != common.CodeServerError {
+		t.Fatalf("code = %v, want %v", code, common.CodeServerError)
+	}
+
+	var instanceCount int64
+	if err := db.Model(&entity.TenantModelInstance{}).
+		Where("instance_name = ?", "new-instance").
+		Count(&instanceCount).Error; err != nil {
+		t.Fatalf("count provider instances: %v", err)
+	}
+	if instanceCount != 0 {
+		t.Fatalf("created instance count = %d, want 0", instanceCount)
+	}
+	var modelCount int64
+	if err := db.Model(&entity.TenantModel{}).
+		Where("model_name IN ?", []string{"plain-model", "remote-model@openai"}).
+		Count(&modelCount).Error; err != nil {
+		t.Fatalf("count provider models: %v", err)
+	}
+	if modelCount != 0 {
+		t.Fatalf("created model count = %d, want 0", modelCount)
+	}
+}
+
+func TestAlterProviderInstanceRollsBackCatalogFailure(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	probe := &remoteModelProbeDriver{
+		DummyModel: modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+		listErr:    errors.New("catalog unavailable"),
+	}
+	probe.newInstanceResult = probe
+	providerInfo := dao.GetModelProviderManager().FindProvider("OpenAI")
+	if providerInfo == nil {
+		t.Fatal("OpenAI provider metadata missing")
+	}
+	originalDriver := providerInfo.ModelDriver
+	providerInfo.ModelDriver = probe
+	t.Cleanup(func() { providerInfo.ModelDriver = originalDriver })
+
+	code, err := NewModelProviderService().AlterProviderInstance(
+		t.Context(),
+		"user-1",
+		"OpenAI",
+		"instance-1",
+		"renamed",
+		"new-key",
+		"",
+		"new-region",
+		[]CreateInstanceModelInfo{{
+			ModelName:  "remote-model@openai",
+			ModelTypes: []string{"embedding"},
+		}},
+		false,
+	)
+	if err == nil || !strings.Contains(err.Error(), "catalog unavailable") {
+		t.Fatalf("AlterProviderInstance() error = %v, want catalog error", err)
+	}
+	if code != common.CodeServerError {
+		t.Fatalf("code = %v, want %v", code, common.CodeServerError)
+	}
+
+	var instance entity.TenantModelInstance
+	if err := db.Where("id = ?", "instance-1").First(&instance).Error; err != nil {
+		t.Fatalf("reload instance: %v", err)
+	}
+	if instance.InstanceName != "default" || instance.APIKey != "sk-test" || instance.Extra != "{}" {
+		t.Fatalf("instance after failure = %#v, want original values", instance)
+	}
+	var model entity.TenantModel
+	if err := db.Where("id = ?", "model-1").First(&model).Error; err != nil {
+		t.Fatalf("reload retained model: %v", err)
+	}
+}
+
+func TestAlterProviderInstanceUsesNormalizedSubmittedNames(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	probe := &remoteModelProbeDriver{
+		DummyModel: modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+		remoteModels: []modelModule.ListModelResponse{{
+			Name: "gpt-test",
+		}},
+	}
+	providerInfo := dao.GetModelProviderManager().FindProvider("OpenAI")
+	if providerInfo == nil {
+		t.Fatal("OpenAI provider metadata missing")
+	}
+	originalDriver := providerInfo.ModelDriver
+	providerInfo.ModelDriver = probe
+	t.Cleanup(func() { providerInfo.ModelDriver = originalDriver })
+
+	code, err := NewModelProviderService().AlterProviderInstance(
+		t.Context(),
+		"user-1",
+		"OpenAI",
+		"instance-1",
+		"",
+		"sk-test",
+		"",
+		"",
+		[]CreateInstanceModelInfo{{
+			ModelName:  "gpt-test@openai",
+			ModelTypes: []string{"chat"},
+			MaxTokens:  2048,
+		}},
+		false,
+	)
+	if err != nil {
+		t.Fatalf("AlterProviderInstance() error = %v", err)
+	}
+	if code != common.CodeSuccess {
+		t.Fatalf("code = %v, want %v", code, common.CodeSuccess)
+	}
+
+	var models []entity.TenantModel
+	if err := db.Where("instance_id = ?", "instance-1").Find(&models).Error; err != nil {
+		t.Fatalf("list instance models: %v", err)
+	}
+	if len(models) != 1 || models[0].ID != "model-1" || models[0].ModelName != "gpt-test" {
+		t.Fatalf("models = %#v, want original normalized model row", models)
+	}
+}
+
+func TestAlterProviderInstanceRejectsDuplicateInstanceNameAsConflict(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	if err := db.Create(&entity.TenantModelInstance{
+		ID:           "instance-2",
+		ProviderID:   "provider-1",
+		InstanceName: "existing-name",
+		Status:       "active",
+		Extra:        "{}",
+	}).Error; err != nil {
+		t.Fatalf("seed conflicting instance: %v", err)
+	}
+
+	code, err := NewModelProviderService().AlterProviderInstance(
+		t.Context(),
+		"user-1",
+		"OpenAI",
+		"instance-1",
+		"existing-name",
+		"sk-test",
+		"",
+		"",
+		[]CreateInstanceModelInfo{{
+			ModelName:  "gpt-test",
+			ModelTypes: []string{"chat"},
+		}},
+		false,
+	)
+	if err == nil || !errors.Is(err, dao.ErrTenantModelInstanceExists) {
+		t.Fatalf(
+			"AlterProviderInstance() error = %v, want duplicate instance error",
+			err,
+		)
+	}
+	if code != common.CodeConflict {
+		t.Fatalf("code = %v, want %v", code, common.CodeConflict)
+	}
+
+	var original entity.TenantModelInstance
+	if err := db.Where("id = ?", "instance-1").First(&original).Error; err != nil {
+		t.Fatalf("reload original instance: %v", err)
+	}
+	if original.InstanceName != "default" {
+		t.Fatalf(
+			"original instance name = %q, want unchanged default",
+			original.InstanceName,
+		)
+	}
+}
+
+func TestCreateProviderInstanceRejectsNormalizedDuplicateNames(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	probe := &remoteModelProbeDriver{
+		DummyModel: modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+		remoteModels: []modelModule.ListModelResponse{{
+			Name: "same-model",
+		}},
+	}
+	providerInfo := dao.GetModelProviderManager().FindProvider("OpenAI")
+	if providerInfo == nil {
+		t.Fatal("OpenAI provider metadata missing")
+	}
+	originalDriver := providerInfo.ModelDriver
+	providerInfo.ModelDriver = probe
+	t.Cleanup(func() { providerInfo.ModelDriver = originalDriver })
+
+	code, err := NewModelProviderService().CreateProviderInstance(
+		t.Context(),
+		"OpenAI",
+		"new-instance",
+		"test-key",
+		"",
+		"",
+		"user-1",
+		[]CreateInstanceModelInfo{
+			{ModelName: "same-model", ModelTypes: []string{"chat"}},
+			{ModelName: "same-model@openai", ModelTypes: []string{"embedding"}},
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "duplicate normalized model") {
+		t.Fatalf("CreateProviderInstance() error = %v, want normalized duplicate error", err)
+	}
+	if code != common.CodeConflict {
+		t.Fatalf("code = %v, want %v", code, common.CodeConflict)
+	}
+	var count int64
+	if err := db.Model(&entity.TenantModelInstance{}).
+		Where("instance_name = ?", "new-instance").
+		Count(&count).Error; err != nil {
+		t.Fatalf("count provider instances: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("created instance count = %d, want 0", count)
+	}
+}
+
+func TestCreateProviderInstanceClassifiesUnlistedRemoteModelAsDataError(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	probe := &remoteModelProbeDriver{
+		DummyModel: modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+		remoteModels: []modelModule.ListModelResponse{{
+			Name: "different-model",
+		}},
+	}
+	probe.newInstanceResult = probe
+	providerInfo := dao.GetModelProviderManager().FindProvider("OpenAI")
+	if providerInfo == nil {
+		t.Fatal("OpenAI provider metadata missing")
+	}
+	originalDriver := providerInfo.ModelDriver
+	providerInfo.ModelDriver = probe
+	t.Cleanup(func() { providerInfo.ModelDriver = originalDriver })
+
+	code, err := NewModelProviderService().CreateProviderInstance(
+		t.Context(),
+		"OpenAI",
+		"new-instance",
+		"test-key",
+		"",
+		"",
+		"user-1",
+		[]CreateInstanceModelInfo{{
+			ModelName:  "remote-model@openai",
+			ModelTypes: []string{"embedding"},
+		}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "not found in remote model catalog") {
+		t.Fatalf("CreateProviderInstance() error = %v, want unlisted model error", err)
+	}
+	if code != common.CodeDataError {
+		t.Fatalf("code = %v, want %v", code, common.CodeDataError)
+	}
+}
+
+func TestCreateProviderInstanceRejectsExistingInstanceAsConflict(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+
+	code, err := NewModelProviderService().CreateProviderInstance(
+		t.Context(),
+		"OpenAI",
+		"default",
+		"test-key",
+		"",
+		"",
+		"user-1",
+		nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("CreateProviderInstance() error = %v, want duplicate instance error", err)
+	}
+	if code != common.CodeConflict {
+		t.Fatalf("code = %v, want %v", code, common.CodeConflict)
+	}
+}
+
+func TestCreateNameOnlyProviderInstanceRejectsExistingInstanceAsConflict(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	if err := db.Create(&entity.TenantModelInstance{
+		ID:           "instance-existing",
+		ProviderID:   "provider-1",
+		InstanceName: "existing-name",
+		Status:       "active",
+		Extra:        "{}",
+	}).Error; err != nil {
+		t.Fatalf("seed existing instance: %v", err)
+	}
+
+	code, err := NewModelProviderService().CreateNameOnlyProviderInstance(
+		t.Context(),
+		"OpenAI",
+		"existing-name",
+		"user-1",
+	)
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("CreateNameOnlyProviderInstance() error = %v, want duplicate instance error", err)
+	}
+	if code != common.CodeConflict {
+		t.Fatalf("code = %v, want %v", code, common.CodeConflict)
+	}
+}
+
+func TestCreateProviderInstanceRejectsBlankModelNameAsBadRequest(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+
+	code, err := NewModelProviderService().CreateProviderInstance(
+		t.Context(),
+		"OpenAI",
+		"new-instance",
+		"test-key",
+		"",
+		"",
+		"user-1",
+		[]CreateInstanceModelInfo{{
+			ModelName:  "",
+			ModelTypes: []string{"chat"},
+		}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "model name is required") {
+		t.Fatalf("CreateProviderInstance() error = %v, want required-name error", err)
+	}
+	if code != common.CodeBadRequest {
+		t.Fatalf("code = %v, want %v", code, common.CodeBadRequest)
+	}
+}
+
+func TestAlterProviderInstanceRejectsBlankModelNameAsBadRequest(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+
+	code, err := NewModelProviderService().AlterProviderInstance(
+		t.Context(),
+		"user-1",
+		"OpenAI",
+		"instance-1",
+		"",
+		"sk-test",
+		"",
+		"",
+		[]CreateInstanceModelInfo{{
+			ModelName:  "",
+			ModelTypes: []string{"chat"},
+		}},
+		false,
+	)
+	if err == nil || !strings.Contains(err.Error(), "model name is required") {
+		t.Fatalf("AlterProviderInstance() error = %v, want required-name error", err)
+	}
+	if code != common.CodeBadRequest {
+		t.Fatalf("code = %v, want %v", code, common.CodeBadRequest)
+	}
+}
+
+func TestAlterProviderInstanceRejectsNormalizedDuplicateNamesAsConflict(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	probe := &remoteModelProbeDriver{
+		DummyModel: modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+		remoteModels: []modelModule.ListModelResponse{{
+			Name: "same-model",
+		}},
+	}
+	providerInfo := dao.GetModelProviderManager().FindProvider("OpenAI")
+	if providerInfo == nil {
+		t.Fatal("OpenAI provider metadata missing")
+	}
+	originalDriver := providerInfo.ModelDriver
+	providerInfo.ModelDriver = probe
+	t.Cleanup(func() { providerInfo.ModelDriver = originalDriver })
+
+	code, err := NewModelProviderService().AlterProviderInstance(
+		t.Context(),
+		"user-1",
+		"OpenAI",
+		"instance-1",
+		"",
+		"sk-test",
+		"",
+		"",
+		[]CreateInstanceModelInfo{
+			{ModelName: "same-model", ModelTypes: []string{"chat"}},
+			{ModelName: "same-model@openai", ModelTypes: []string{"embedding"}},
+		},
+		false,
+	)
+	if err == nil || !strings.Contains(err.Error(), "duplicate normalized model") {
+		t.Fatalf("AlterProviderInstance() error = %v, want normalized duplicate error", err)
+	}
+	if code != common.CodeConflict {
+		t.Fatalf("code = %v, want %v", code, common.CodeConflict)
+	}
+}
+
+func TestAlterProviderInstanceRejectsMissingInstanceUpdateRow(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	if err := db.Exec(`
+		CREATE TRIGGER remove_model_instance_before_update
+		BEFORE UPDATE ON tenant_model_instance
+		BEGIN
+			DELETE FROM tenant_model_instance WHERE id = OLD.id;
+			SELECT RAISE(IGNORE);
+		END
+	`).Error; err != nil {
+		t.Fatalf("create instance update trigger: %v", err)
+	}
+
+	code, err := NewModelProviderService().AlterProviderInstance(
+		t.Context(), "user-1", "OpenAI", "instance-1", "", "new-key", "", "",
+		[]CreateInstanceModelInfo{{ModelName: "gpt-test", ModelTypes: []string{"chat"}}}, false,
+	)
+	if err == nil || !strings.Contains(err.Error(), "updated 0 rows") {
+		t.Fatalf("AlterProviderInstance() error = %v, want zero-row instance update error", err)
+	}
+	if code != common.CodeServerError {
+		t.Fatalf("code = %v, want %v", code, common.CodeServerError)
+	}
+	var count int64
+	if err := db.Model(&entity.TenantModelInstance{}).Where("id = ?", "instance-1").Count(&count).Error; err != nil {
+		t.Fatalf("count instance after rollback: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("instance count after rollback = %d, want 1", count)
+	}
+}
+
+func TestAlterProviderInstanceRejectsMissingModelUpdateRow(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	if err := db.Exec(`
+		CREATE TRIGGER remove_model_before_provider_update
+		BEFORE UPDATE ON tenant_model
+		BEGIN
+			DELETE FROM tenant_model WHERE id = OLD.id;
+			SELECT RAISE(IGNORE);
+		END
+	`).Error; err != nil {
+		t.Fatalf("create model update trigger: %v", err)
+	}
+
+	code, err := NewModelProviderService().AlterProviderInstance(
+		t.Context(), "user-1", "OpenAI", "instance-1", "", "new-key", "", "",
+		[]CreateInstanceModelInfo{{ModelName: "gpt-test", ModelTypes: []string{"embedding"}}}, false,
+	)
+	if err == nil || !strings.Contains(err.Error(), "updated 0 rows") {
+		t.Fatalf("AlterProviderInstance() error = %v, want zero-row model update error", err)
+	}
+	if code != common.CodeServerError {
+		t.Fatalf("code = %v, want %v", code, common.CodeServerError)
+	}
+	var instance entity.TenantModelInstance
+	if err := db.Where("id = ?", "instance-1").First(&instance).Error; err != nil {
+		t.Fatalf("reload instance after rollback: %v", err)
+	}
+	if instance.APIKey != "sk-test" {
+		t.Fatalf("instance API key changed despite rollback")
+	}
+	var model entity.TenantModel
+	if err := db.Where("id = ?", "model-1").First(&model).Error; err != nil {
+		t.Fatalf("reload model after rollback: %v", err)
+	}
+	if model.ModelType != int(entity.ModelTypeChat) {
+		t.Fatalf("model type = %d, want unchanged chat", model.ModelType)
+	}
+}
+
+func TestAlterProviderInstanceRejectsChangedDeleteCount(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	if err := db.Exec(`
+		CREATE TRIGGER ignore_model_delete
+		BEFORE DELETE ON tenant_model
+		BEGIN
+			SELECT RAISE(IGNORE);
+		END
+	`).Error; err != nil {
+		t.Fatalf("create model delete trigger: %v", err)
+	}
+
+	code, err := NewModelProviderService().AlterProviderInstance(
+		t.Context(), "user-1", "OpenAI", "instance-1", "", "new-key", "", "", nil, false,
+	)
+	if err == nil || !strings.Contains(err.Error(), "deleted 0 rows") {
+		t.Fatalf("AlterProviderInstance() error = %v, want delete-count error", err)
+	}
+	if code != common.CodeServerError {
+		t.Fatalf("code = %v, want %v", code, common.CodeServerError)
+	}
+	var instance entity.TenantModelInstance
+	if err := db.Where("id = ?", "instance-1").First(&instance).Error; err != nil {
+		t.Fatalf("reload instance after rollback: %v", err)
+	}
+	if instance.APIKey != "sk-test" {
+		t.Fatalf("instance API key changed despite rollback")
+	}
+	var modelCount int64
+	if err := db.Model(&entity.TenantModel{}).Where("id = ?", "model-1").Count(&modelCount).Error; err != nil {
+		t.Fatalf("count model after rollback: %v", err)
+	}
+	if modelCount != 1 {
+		t.Fatalf("model count after rollback = %d, want 1", modelCount)
+	}
 }
 
 func TestValidateEmbeddingModel(t *testing.T) {
@@ -76,18 +1454,22 @@ func TestValidateEmbeddingModel(t *testing.T) {
 			wantErr:            "input batch size <= 0",
 		},
 		{
-			name:               "rejects missing max dimension",
+			name:               "allows unknown max dimension",
 			model:              &modelModule.Model{MaxBatchSize: &maxBatchSize},
 			requestedDimension: 1024,
 			requestedBatchSize: 1,
-			wantErr:            "max dimension is nil",
 		},
 		{
-			name:               "rejects missing max batch size",
+			name:               "allows unknown max batch size",
 			model:              &modelModule.Model{MaxDimension: &maxDimension},
 			requestedDimension: 1024,
 			requestedBatchSize: 1,
-			wantErr:            "max batch size is nil",
+		},
+		{
+			name:               "allows unknown embedding limits",
+			model:              &modelModule.Model{Name: "custom-embedding"},
+			requestedDimension: 1024,
+			requestedBatchSize: 1,
 		},
 		{
 			name:               "allows dimension listed in explicit options",
@@ -295,6 +1677,178 @@ func TestModelProviderServiceAlterModelStatusByID(t *testing.T) {
 	}
 }
 
+func TestModelProviderServiceAlterModelDoesNotPartiallyPersistFailedUpdate(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	if err := db.Exec(`
+		CREATE TRIGGER fail_tenant_model_metadata_update
+		BEFORE UPDATE OF model_type, extra ON tenant_model
+		BEGIN
+			SELECT RAISE(FAIL, 'forced metadata update failure');
+		END
+	`).Error; err != nil {
+		t.Fatalf("failed to create update trigger: %v", err)
+	}
+
+	code, err := NewModelProviderService().AlterModel(
+		t.Context(),
+		"OpenAI",
+		"default",
+		"",
+		"user-1",
+		"model-1",
+		map[string]interface{}{
+			"status":     "inactive",
+			"model_type": "embedding",
+			"max_tokens": 2048,
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "forced metadata update failure") {
+		t.Fatalf("AlterModel() error = %v, want forced metadata update failure", err)
+	}
+	if code != common.CodeServerError {
+		t.Fatalf("code = %v, want %v", code, common.CodeServerError)
+	}
+
+	var got entity.TenantModel
+	if err := db.Where("id = ?", "model-1").First(&got).Error; err != nil {
+		t.Fatalf("failed to reload tenant model: %v", err)
+	}
+	if got.Status != "active" {
+		t.Fatalf("status = %q, want unchanged active status", got.Status)
+	}
+	if got.ModelType != int(entity.ModelTypeChat) {
+		t.Fatalf("model_type = %d, want unchanged %d", got.ModelType, entity.ModelTypeChat)
+	}
+}
+
+func TestModelProviderServiceAlterModelRejectsZeroUpdatedRows(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	if err := db.Exec(`
+		CREATE TRIGGER remove_tenant_model_before_update
+		BEFORE UPDATE ON tenant_model
+		BEGIN
+			DELETE FROM tenant_model WHERE id = OLD.id;
+			SELECT RAISE(IGNORE);
+		END
+	`).Error; err != nil {
+		t.Fatalf("failed to create update trigger: %v", err)
+	}
+
+	code, err := NewModelProviderService().AlterModel(
+		t.Context(),
+		"OpenAI",
+		"default",
+		"",
+		"user-1",
+		"model-1",
+		map[string]interface{}{"status": "inactive"},
+	)
+	if err == nil || !strings.Contains(err.Error(), "updated 0 rows") {
+		t.Fatalf("AlterModel() error = %v, want zero-row update error", err)
+	}
+	if code != common.CodeServerError {
+		t.Fatalf("code = %v, want %v", code, common.CodeServerError)
+	}
+}
+
+func TestModelProviderServiceAlterModelStatusByNameRejectsAmbiguousRows(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	duplicate := &entity.TenantModel{
+		ID:         "model-duplicate",
+		ProviderID: "provider-1",
+		InstanceID: "instance-1",
+		ModelName:  "gpt-test",
+		ModelType:  int(entity.ModelTypeEmbedding),
+		Status:     "active",
+	}
+	if err := db.Create(duplicate).Error; err != nil {
+		t.Fatalf("failed to seed duplicate tenant model: %v", err)
+	}
+
+	code, err := NewModelProviderService().AlterModel(
+		t.Context(),
+		"OpenAI",
+		"default",
+		"gpt-test",
+		"user-1",
+		"",
+		map[string]interface{}{"status": "inactive"},
+	)
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("AlterModel() error = %v, want ambiguity error", err)
+	}
+	if code != common.CodeConflict {
+		t.Fatalf("code = %v, want %v", code, common.CodeConflict)
+	}
+
+	var rows []entity.TenantModel
+	if err := db.Where("provider_id = ? AND instance_id = ? AND model_name = ?", "provider-1", "instance-1", "gpt-test").Find(&rows).Error; err != nil {
+		t.Fatalf("failed to reload duplicate models: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("row count = %d, want 2", len(rows))
+	}
+	for _, row := range rows {
+		if row.Status != "active" {
+			t.Fatalf("model %q status = %q, want unchanged active status", row.ID, row.Status)
+		}
+	}
+}
+
+func TestModelProviderServiceAlterModelStatusByNameAndIDDisambiguatesRows(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	duplicate := &entity.TenantModel{
+		ID:         "model-duplicate",
+		ProviderID: "provider-1",
+		InstanceID: "instance-1",
+		ModelName:  "gpt-test",
+		ModelType:  int(entity.ModelTypeEmbedding),
+		Status:     "active",
+	}
+	if err := db.Create(duplicate).Error; err != nil {
+		t.Fatalf("failed to seed duplicate tenant model: %v", err)
+	}
+
+	code, err := NewModelProviderService().AlterModel(
+		t.Context(),
+		"OpenAI",
+		"default",
+		"gpt-test",
+		"user-1",
+		duplicate.ID,
+		map[string]interface{}{"status": "inactive"},
+	)
+	if err != nil {
+		t.Fatalf("AlterModel() error = %v", err)
+	}
+	if code != common.CodeSuccess {
+		t.Fatalf("code = %v, want %v", code, common.CodeSuccess)
+	}
+
+	var rows []entity.TenantModel
+	if err := db.Where("provider_id = ? AND instance_id = ? AND model_name = ?", "provider-1", "instance-1", "gpt-test").Order("id").Find(&rows).Error; err != nil {
+		t.Fatalf("failed to reload duplicate models: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("row count = %d, want 2", len(rows))
+	}
+	statuses := make(map[string]string, len(rows))
+	for _, row := range rows {
+		statuses[row.ID] = row.Status
+	}
+	if statuses["model-1"] != "active" || statuses[duplicate.ID] != "inactive" {
+		t.Fatalf("statuses = %#v, want only %q inactive", statuses, duplicate.ID)
+	}
+}
+
 func TestModelProviderServiceGetModelConfigByID(t *testing.T) {
 	db := setupModelProviderServiceTestDB(t)
 	useModelProviderServiceTestDB(t, db)
@@ -313,6 +1867,908 @@ func TestModelProviderServiceGetModelConfigByID(t *testing.T) {
 	}
 	if apiConfig == nil || apiConfig.ApiKey == nil || *apiConfig.ApiKey != "sk-test" {
 		t.Fatalf("apiConfig.ApiKey = %v, want %q", apiConfig.ApiKey, "sk-test")
+	}
+}
+
+func TestGetModelInstanceAndProviderByIDAllowsCustomTenantModel(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+
+	custom := &entity.TenantModel{
+		ID:         "custom-embedding",
+		ProviderID: "provider-1",
+		InstanceID: "instance-1",
+		ModelName:  "tenant-only-embedding",
+		ModelType:  int(entity.ModelTypeEmbedding),
+		Status:     "active",
+	}
+	if err := db.Create(custom).Error; err != nil {
+		t.Fatalf("failed to seed custom model: %v", err)
+	}
+
+	modelID := custom.ID
+	info, err := NewModelProviderService().getModelInstanceAndProviderByID(
+		t.Context(),
+		&modelID,
+		"user-1",
+		&modelModule.APIConfig{},
+	)
+	if err != nil {
+		t.Fatalf("getModelInstanceAndProviderByID() error = %v", err)
+	}
+	if info == nil || info.ModelInfo == nil {
+		t.Fatal("getModelInstanceAndProviderByID() returned no model metadata")
+	}
+	if info.ModelInfo.Name != custom.ModelName {
+		t.Fatalf("model name = %q, want %q", info.ModelInfo.Name, custom.ModelName)
+	}
+	if !info.ModelInfo.ModelTypeMap["embedding"] {
+		t.Fatalf("model types = %#v, want embedding", info.ModelInfo.ModelTypeMap)
+	}
+	if info.ModelInfo.MaxDimension != nil || info.ModelInfo.MaxBatchSize != nil {
+		t.Fatalf("custom model limits = (%v, %v), want unknown", info.ModelInfo.MaxDimension, info.ModelInfo.MaxBatchSize)
+	}
+}
+
+func TestGetModelInstanceAndProviderByNameReturnsUnexpectedLookupErrors(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	if err := db.Migrator().DropTable(&entity.TenantModel{}); err != nil {
+		t.Fatalf("failed to break tenant model lookup: %v", err)
+	}
+
+	providerName := "OpenAI"
+	instanceName := "default"
+	modelName := "text-embedding-3-small"
+	_, err := NewModelProviderService().getModelInstanceAndProviderByName(
+		t.Context(),
+		&providerName,
+		&instanceName,
+		&modelName,
+		"user-1",
+		&modelModule.APIConfig{},
+	)
+	if err == nil || !strings.Contains(err.Error(), "lookup failed") {
+		t.Fatalf("getModelInstanceAndProviderByName() error = %v, want lookup failure", err)
+	}
+}
+
+func TestEmbedTextMalformedInstanceMetadataReturnsServerError(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	if err := db.Model(&entity.TenantModelInstance{}).
+		Where("id = ?", "instance-1").
+		Update("extra", "{").Error; err != nil {
+		t.Fatalf("failed to corrupt instance metadata: %v", err)
+	}
+
+	modelID := "model-1"
+	response, code, err := NewModelProviderService().EmbedText(
+		t.Context(),
+		nil,
+		nil,
+		nil,
+		&modelID,
+		"user-1",
+		[]string{"test"},
+		&modelModule.APIConfig{},
+		&modelModule.EmbeddingConfig{Dimension: 1536},
+	)
+	if err == nil {
+		t.Fatal("EmbedText() error = nil, want malformed metadata error")
+	}
+	if code != common.CodeServerError {
+		t.Fatalf("code = %v, want %v", code, common.CodeServerError)
+	}
+	if response != nil {
+		t.Fatalf("response = %#v, want nil", response)
+	}
+}
+
+func TestEmbedTextWithoutOwnerTenantReturnsNotFoundError(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+
+	modelID := "model-1"
+	response, code, err := NewModelProviderService().EmbedText(
+		t.Context(),
+		nil,
+		nil,
+		nil,
+		&modelID,
+		"user-without-tenant",
+		[]string{"test"},
+		&modelModule.APIConfig{},
+		&modelModule.EmbeddingConfig{Dimension: 1536},
+	)
+	if err == nil || !strings.Contains(err.Error(), "no tenant") {
+		t.Fatalf("EmbedText() error = %v, want no-tenant error", err)
+	}
+	if code != common.CodeNotFound {
+		t.Fatalf("code = %v, want %v", code, common.CodeNotFound)
+	}
+	if response != nil {
+		t.Fatalf("response = %#v, want nil", response)
+	}
+}
+
+func TestModelResolutionFailureRejectsNilResult(t *testing.T) {
+	err := modelResolutionFailure(nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "empty model resolution result") {
+		t.Fatalf("modelResolutionFailure() error = %v, want invariant error", err)
+	}
+	if code := modelResolutionErrorCode(err); code != common.CodeServerError {
+		t.Fatalf("code = %v, want %v", code, common.CodeServerError)
+	}
+}
+
+func TestEmbedTextClassifiesMissingNamedModelAsNotFound(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+
+	providerName := "OpenAI"
+	instanceName := "default"
+	modelName := "tenant-model-that-does-not-exist"
+	response, code, err := NewModelProviderService().EmbedText(
+		t.Context(),
+		&providerName,
+		&instanceName,
+		&modelName,
+		nil,
+		"user-1",
+		[]string{"test"},
+		&modelModule.APIConfig{},
+		&modelModule.EmbeddingConfig{Dimension: 1536},
+	)
+	if err == nil || !errors.Is(err, errTenantModelNotFound) {
+		t.Fatalf("EmbedText() error = %v, want not-found error", err)
+	}
+	if code != common.CodeNotFound {
+		t.Fatalf("code = %v, want %v", code, common.CodeNotFound)
+	}
+	if response != nil {
+		t.Fatalf("response = %#v, want nil", response)
+	}
+}
+
+func TestEmbedTextClassifiesUnexpectedModelLookupErrorAsServerError(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	if err := db.Migrator().DropTable(&entity.TenantModel{}); err != nil {
+		t.Fatalf("failed to break tenant model lookup: %v", err)
+	}
+
+	providerName := "OpenAI"
+	instanceName := "default"
+	modelName := "text-embedding-3-small"
+	_, code, err := NewModelProviderService().EmbedText(
+		t.Context(),
+		&providerName,
+		&instanceName,
+		&modelName,
+		nil,
+		"user-1",
+		[]string{"test"},
+		&modelModule.APIConfig{},
+		&modelModule.EmbeddingConfig{Dimension: 1536},
+	)
+	if err == nil || !strings.Contains(err.Error(), "lookup failed") {
+		t.Fatalf("EmbedText() error = %v, want lookup failure", err)
+	}
+	if code != common.CodeServerError {
+		t.Fatalf("code = %v, want %v", code, common.CodeServerError)
+	}
+}
+
+func TestEmbedTextClassifiesUnexpectedModelIDLookupErrorAsServerError(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	if err := db.Migrator().DropTable(&entity.TenantModel{}); err != nil {
+		t.Fatalf("failed to break tenant model lookup: %v", err)
+	}
+
+	modelID := "model-1"
+	_, code, err := NewModelProviderService().EmbedText(
+		t.Context(),
+		nil,
+		nil,
+		nil,
+		&modelID,
+		"user-1",
+		[]string{"test"},
+		&modelModule.APIConfig{},
+		&modelModule.EmbeddingConfig{Dimension: 1536},
+	)
+	if err == nil || !strings.Contains(err.Error(), "lookup failed") {
+		t.Fatalf("EmbedText() error = %v, want lookup failure", err)
+	}
+	if code != common.CodeServerError {
+		t.Fatalf("code = %v, want %v", code, common.CodeServerError)
+	}
+}
+
+func TestEmbedTextClassifiesNameScopeLookupErrorsAsServerError(t *testing.T) {
+	tests := []struct {
+		name  string
+		table interface{}
+	}{
+		{name: "user tenant", table: &entity.UserTenant{}},
+		{name: "provider", table: &entity.TenantModelProvider{}},
+		{name: "instance", table: &entity.TenantModelInstance{}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := setupModelProviderServiceTestDB(t)
+			useModelProviderServiceTestDB(t, db)
+			seedModelProviderServiceScope(t, db)
+			if err := db.Migrator().DropTable(test.table); err != nil {
+				t.Fatalf("failed to break %s lookup: %v", test.name, err)
+			}
+
+			providerName := "OpenAI"
+			instanceName := "default"
+			modelName := "text-embedding-3-small"
+			_, code, err := NewModelProviderService().EmbedText(
+				t.Context(),
+				&providerName,
+				&instanceName,
+				&modelName,
+				nil,
+				"user-1",
+				[]string{"test"},
+				&modelModule.APIConfig{},
+				&modelModule.EmbeddingConfig{Dimension: 1536},
+			)
+			if err == nil {
+				t.Fatalf("EmbedText() error = nil, want %s lookup failure", test.name)
+			}
+			if code != common.CodeServerError {
+				t.Fatalf("code = %v, want %v", code, common.CodeServerError)
+			}
+		})
+	}
+}
+
+func TestEmbedTextClassifiesModelIDScopeLookupErrorsAsServerError(t *testing.T) {
+	tests := []struct {
+		name  string
+		table interface{}
+	}{
+		{name: "user tenant", table: &entity.UserTenant{}},
+		{name: "instance", table: &entity.TenantModelInstance{}},
+		{name: "provider", table: &entity.TenantModelProvider{}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := setupModelProviderServiceTestDB(t)
+			useModelProviderServiceTestDB(t, db)
+			seedModelProviderServiceScope(t, db)
+			if err := db.Migrator().DropTable(test.table); err != nil {
+				t.Fatalf("failed to break %s lookup: %v", test.name, err)
+			}
+
+			modelID := "model-1"
+			_, code, err := NewModelProviderService().EmbedText(
+				t.Context(),
+				nil,
+				nil,
+				nil,
+				&modelID,
+				"user-1",
+				[]string{"test"},
+				&modelModule.APIConfig{},
+				&modelModule.EmbeddingConfig{Dimension: 1536},
+			)
+			if err == nil {
+				t.Fatalf("EmbedText() error = nil, want %s lookup failure", test.name)
+			}
+			if code != common.CodeServerError {
+				t.Fatalf("code = %v, want %v", code, common.CodeServerError)
+			}
+		})
+	}
+}
+
+func TestEmbedTextReportsAmbiguousTenantModelsAsConflict(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	modelName := "shared-custom-model"
+	for _, model := range []*entity.TenantModel{
+		{
+			ID:         "shared-chat",
+			ProviderID: "provider-1",
+			InstanceID: "instance-1",
+			ModelName:  modelName,
+			ModelType:  int(entity.ModelTypeChat),
+			Status:     "active",
+		},
+		{
+			ID:         "shared-embedding",
+			ProviderID: "provider-1",
+			InstanceID: "instance-1",
+			ModelName:  modelName,
+			ModelType:  int(entity.ModelTypeEmbedding),
+			Status:     "active",
+		},
+	} {
+		if err := db.Create(model).Error; err != nil {
+			t.Fatalf("failed to seed tenant model: %v", err)
+		}
+	}
+
+	providerName := "OpenAI"
+	instanceName := "default"
+	response, code, err := NewModelProviderService().EmbedText(
+		t.Context(),
+		&providerName,
+		&instanceName,
+		&modelName,
+		nil,
+		"user-1",
+		[]string{"test"},
+		&modelModule.APIConfig{},
+		&modelModule.EmbeddingConfig{Dimension: 1536},
+	)
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("EmbedText() error = %v, want ambiguity error", err)
+	}
+	if code != common.CodeConflict {
+		t.Fatalf("code = %v, want %v", code, common.CodeConflict)
+	}
+	if response != nil {
+		t.Fatalf("response = %#v, want nil", response)
+	}
+}
+
+func TestGetModelInstanceAndProviderByNameRejectsAmbiguousTenantModels(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	modelName := "shared-custom-model"
+	for _, model := range []*entity.TenantModel{
+		{
+			ID:         "shared-chat",
+			ProviderID: "provider-1",
+			InstanceID: "instance-1",
+			ModelName:  modelName,
+			ModelType:  int(entity.ModelTypeChat),
+			Status:     "active",
+		},
+		{
+			ID:         "shared-embedding",
+			ProviderID: "provider-1",
+			InstanceID: "instance-1",
+			ModelName:  modelName,
+			ModelType:  int(entity.ModelTypeEmbedding),
+			Status:     "active",
+		},
+	} {
+		if err := db.Create(model).Error; err != nil {
+			t.Fatalf("failed to seed tenant model: %v", err)
+		}
+	}
+
+	providerName := "OpenAI"
+	instanceName := "default"
+	_, err := NewModelProviderService().getModelInstanceAndProviderByName(
+		t.Context(),
+		&providerName,
+		&instanceName,
+		&modelName,
+		"user-1",
+		&modelModule.APIConfig{},
+	)
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("getModelInstanceAndProviderByName() error = %v, want ambiguity error", err)
+	}
+}
+
+func TestGetModelInstanceAndProviderByNameAllowsCustomTenantModel(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+
+	custom := &entity.TenantModel{
+		ID:         "custom-embedding-by-name",
+		ProviderID: "provider-1",
+		InstanceID: "instance-1",
+		ModelName:  "tenant-only-embedding-by-name",
+		ModelType:  int(entity.ModelTypeEmbedding),
+		Status:     "active",
+	}
+	if err := db.Create(custom).Error; err != nil {
+		t.Fatalf("failed to seed custom model: %v", err)
+	}
+
+	providerName := "OpenAI"
+	instanceName := "default"
+	modelName := custom.ModelName
+	info, err := NewModelProviderService().getModelInstanceAndProviderByName(
+		t.Context(),
+		&providerName,
+		&instanceName,
+		&modelName,
+		"user-1",
+		&modelModule.APIConfig{},
+	)
+	if err != nil {
+		t.Fatalf("getModelInstanceAndProviderByName() error = %v", err)
+	}
+	if info == nil || info.ModelEntity == nil || info.ModelEntity.ID != custom.ID {
+		t.Fatalf("model entity = %#v, want %q", info, custom.ID)
+	}
+	if info.ModelInfo == nil || !info.ModelInfo.ModelTypeMap["embedding"] {
+		t.Fatalf("model metadata = %#v, want embedding", info.ModelInfo)
+	}
+}
+
+func TestGetModelInstanceAndProviderByIDKeepsTenantScope(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+
+	foreign := &entity.TenantModelProvider{
+		ID:           "provider-foreign",
+		TenantID:     "tenant-foreign",
+		ProviderName: "OpenAI",
+	}
+	instance := &entity.TenantModelInstance{
+		ID:           "instance-foreign",
+		ProviderID:   foreign.ID,
+		InstanceName: "default",
+		Status:       "active",
+		Extra:        "{}",
+	}
+	model := &entity.TenantModel{
+		ID:         "model-foreign",
+		ProviderID: foreign.ID,
+		InstanceID: instance.ID,
+		ModelName:  "foreign-embedding",
+		ModelType:  int(entity.ModelTypeEmbedding),
+		Status:     "active",
+	}
+	for _, row := range []interface{}{foreign, instance, model} {
+		if err := db.Create(row).Error; err != nil {
+			t.Fatalf("failed to seed %T: %v", row, err)
+		}
+	}
+
+	modelID := model.ID
+	_, err := NewModelProviderService().getModelInstanceAndProviderByID(
+		t.Context(),
+		&modelID,
+		"user-1",
+		&modelModule.APIConfig{},
+	)
+	if err == nil || !errors.Is(err, errTenantModelNotFound) {
+		t.Fatalf(
+			"getModelInstanceAndProviderByID() error = %v, want scoped not-found error",
+			err,
+		)
+	}
+}
+
+func TestEmbedTextClassifiesForeignModelAsNotFound(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+
+	foreign := &entity.TenantModelProvider{
+		ID:           "provider-foreign-public",
+		TenantID:     "tenant-foreign",
+		ProviderName: "OpenAI",
+	}
+	instance := &entity.TenantModelInstance{
+		ID:           "instance-foreign-public",
+		ProviderID:   foreign.ID,
+		InstanceName: "default",
+		Status:       "active",
+		Extra:        "{}",
+	}
+	model := &entity.TenantModel{
+		ID:         "model-foreign-public",
+		ProviderID: foreign.ID,
+		InstanceID: instance.ID,
+		ModelName:  "foreign-embedding-public",
+		ModelType:  int(entity.ModelTypeEmbedding),
+		Status:     "active",
+		Extra:      `{"max_dimension":1536,"max_batch_size":1,"dimensions":[1536]}`,
+	}
+	for _, row := range []interface{}{foreign, instance, model} {
+		if err := db.Create(row).Error; err != nil {
+			t.Fatalf("failed to seed %T: %v", row, err)
+		}
+	}
+
+	modelID := model.ID
+	response, code, err := NewModelProviderService().EmbedText(
+		t.Context(), nil, nil, nil, &modelID, "user-1", []string{"test"},
+		&modelModule.APIConfig{}, &modelModule.EmbeddingConfig{Dimension: 1536},
+	)
+	if err == nil || !errors.Is(err, errTenantModelNotFound) {
+		t.Fatalf("EmbedText() error = %v, want scoped not-found error", err)
+	}
+	if code != common.CodeNotFound {
+		t.Fatalf("code = %v, want %v", code, common.CodeNotFound)
+	}
+	if response != nil {
+		t.Fatalf("response = %#v, want nil", response)
+	}
+}
+
+func TestModelResolutionPreservesCanceledContext(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	providerName := "OpenAI"
+	instanceName := "default"
+	modelName := "gpt-test"
+	modelID := "model-1"
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "by name",
+			call: func() error {
+				_, err := NewModelProviderService().getModelInstanceAndProviderByName(
+					ctx, &providerName, &instanceName, &modelName, "user-1", nil,
+				)
+				return err
+			},
+		},
+		{
+			name: "by ID",
+			call: func() error {
+				_, err := NewModelProviderService().getModelInstanceAndProviderByID(
+					ctx, &modelID, "user-1", nil,
+				)
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.call()
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("error = %v, want context.Canceled identity", err)
+			}
+			if !errors.Is(err, errTenantModelLookup) {
+				t.Fatalf("error = %v, want lookup-failure identity", err)
+			}
+		})
+	}
+}
+
+func TestEmbedTextAllowsProviderModelWithoutEmbeddingLimits(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+
+	custom := &entity.TenantModel{
+		ID:         "custom-embedding-no-limits",
+		ProviderID: "provider-1",
+		InstanceID: "instance-1",
+		ModelName:  "tenant-only-embedding-no-limits",
+		ModelType:  int(entity.ModelTypeEmbedding),
+		Status:     "active",
+	}
+	if err := db.Create(custom).Error; err != nil {
+		t.Fatalf("failed to seed custom model: %v", err)
+	}
+
+	modelID := custom.ID
+	_, code, err := NewModelProviderService().EmbedText(
+		t.Context(),
+		nil,
+		nil,
+		nil,
+		&modelID,
+		"user-1",
+		[]string{"test"},
+		&modelModule.APIConfig{},
+		&modelModule.EmbeddingConfig{Dimension: 1024},
+	)
+	if code == common.CodeBadRequest && err != nil && strings.Contains(err.Error(), "embedding max dimension is nil") {
+		t.Fatalf("EmbedText() rejected provider model with unknown limits: %v", err)
+	}
+}
+
+func TestEmbedTextCallsCustomTenantModelProvider(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+
+	previousAllowAnyHost := utility.AllowAnyHostForTest
+	utility.AllowAnyHostForTest = true
+	t.Cleanup(func() { utility.AllowAnyHostForTest = previousAllowAnyHost })
+
+	var gotPath string
+	var gotPathMu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPathMu.Lock()
+		gotPath = r.URL.Path
+		gotPathMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"embedding":[0.25,-0.5],"index":0}]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	if err := db.Model(&entity.TenantModelInstance{}).
+		Where("id = ?", "instance-1").
+		Updates(map[string]interface{}{"extra": `{"base_url":"` + server.URL + `"}`}).Error; err != nil {
+		t.Fatalf("failed to set test provider URL: %v", err)
+	}
+	custom := &entity.TenantModel{
+		ID:         "custom-embedding-provider-call",
+		ProviderID: "provider-1",
+		InstanceID: "instance-1",
+		ModelName:  "tenant-only-embedding-provider-call",
+		ModelType:  int(entity.ModelTypeEmbedding),
+		Status:     "active",
+		Extra:      `{"max_dimension":2,"max_batch_size":1,"dimensions":[2]}`,
+	}
+	if err := db.Create(custom).Error; err != nil {
+		t.Fatalf("failed to seed custom model: %v", err)
+	}
+
+	modelID := custom.ID
+	response, code, err := NewModelProviderService().EmbedText(
+		t.Context(), nil, nil, nil, &modelID, "user-1", []string{"test"},
+		&modelModule.APIConfig{}, &modelModule.EmbeddingConfig{Dimension: 2},
+	)
+	if err != nil {
+		t.Fatalf("EmbedText() error = %v", err)
+	}
+	if code != common.CodeSuccess {
+		t.Fatalf("code = %v, want %v", code, common.CodeSuccess)
+	}
+	gotPathMu.Lock()
+	actualPath := gotPath
+	gotPathMu.Unlock()
+	if actualPath != "/embeddings" {
+		t.Fatalf("provider path = %q, want /embeddings", actualPath)
+	}
+	if len(response) != 1 || len(response[0].Embedding) != 2 {
+		t.Fatalf("response = %#v, want one 2-dimensional embedding", response)
+	}
+}
+
+type nilRerankModel struct {
+	modelModule.ModelDriver
+}
+
+func (m *nilRerankModel) Rerank(
+	context.Context,
+	*string,
+	string,
+	[]string,
+	*modelModule.APIConfig,
+	*modelModule.RerankConfig,
+	*common.ModelUsage,
+) (*modelModule.RerankResponse, error) {
+	return nil, nil
+}
+
+func TestRerankDocumentRejectsNilProviderResponse(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	custom := &entity.TenantModel{
+		ID:         "custom-rerank-model",
+		ProviderID: "provider-1",
+		InstanceID: "instance-1",
+		ModelName:  "tenant-only-rerank-model",
+		ModelType:  int(entity.ModelTypeRerank),
+		Status:     "active",
+	}
+	if err := db.Create(custom).Error; err != nil {
+		t.Fatalf("failed to seed custom model: %v", err)
+	}
+
+	service := NewModelProviderService()
+	serviceDriver := &nilRerankModel{
+		ModelDriver: modelModule.NewDummyModel(nil, modelModule.URLSuffix{}),
+	}
+	previousManager := dao.GetModelProviderManager()
+	providerInfo := previousManager.FindProvider("OpenAI")
+	if providerInfo == nil {
+		t.Fatal("OpenAI provider metadata missing")
+	}
+	originalDriver := providerInfo.ModelDriver
+	providerInfo.ModelDriver = serviceDriver
+	t.Cleanup(func() { providerInfo.ModelDriver = originalDriver })
+
+	modelID := custom.ID
+	response, code, err := service.RerankDocument(
+		t.Context(), nil, nil, nil, &modelID, "user-1", "query", []string{"doc"},
+		&modelModule.APIConfig{}, &modelModule.RerankConfig{},
+	)
+	if err == nil || !strings.Contains(err.Error(), "empty rerank response") {
+		t.Fatalf("RerankDocument() error = %v, want empty response error", err)
+	}
+	if code != common.CodeServerError {
+		t.Fatalf("code = %v, want %v", code, common.CodeServerError)
+	}
+	if response != nil {
+		t.Fatalf("response = %#v, want nil", response)
+	}
+}
+
+func TestModelIDOnlyOperationsUseResolvedModelAndProviderNames(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	useModelProviderServiceTestDB(t, db)
+	seedModelProviderServiceScope(t, db)
+	custom := &entity.TenantModel{
+		ID:         "custom-media-model",
+		ProviderID: "provider-1",
+		InstanceID: "instance-1",
+		ModelName:  "tenant-only-media-model",
+		ModelType: int(
+			entity.ModelTypeSpeech2Text |
+				entity.ModelTypeTTS |
+				entity.ModelTypeOCR,
+		),
+		Status: "active",
+	}
+	if err := db.Create(custom).Error; err != nil {
+		t.Fatalf("failed to seed custom model: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		wantErr string
+		call    func(*ModelProviderService, *string) (common.ErrorCode, error)
+	}{
+		{
+			name:    "transcribe audio",
+			wantErr: "file is missing",
+			call: func(service *ModelProviderService, modelID *string) (common.ErrorCode, error) {
+				_, code, err := service.TranscribeAudio(
+					t.Context(), nil, nil, nil, modelID, "user-1", nil,
+					&modelModule.APIConfig{}, nil,
+				)
+				return code, err
+			},
+		},
+		{
+			name:    "transcribe audio stream",
+			wantErr: "file is missing",
+			call: func(service *ModelProviderService, modelID *string) (common.ErrorCode, error) {
+				return service.TranscribeAudioStream(
+					t.Context(), nil, nil, nil, modelID, "user-1", nil,
+					&modelModule.APIConfig{}, nil,
+					func(*string, *string) error { return nil },
+				)
+			},
+		},
+		{
+			name:    "audio speech",
+			wantErr: "audio content is empty",
+			call: func(service *ModelProviderService, modelID *string) (common.ErrorCode, error) {
+				_, code, err := service.AudioSpeech(
+					t.Context(), nil, nil, nil, modelID, "user-1", nil,
+					&modelModule.APIConfig{}, nil,
+				)
+				return code, err
+			},
+		},
+		{
+			name:    "audio speech stream",
+			wantErr: "audio content is empty",
+			call: func(service *ModelProviderService, modelID *string) (common.ErrorCode, error) {
+				return service.AudioSpeechStream(
+					t.Context(), nil, nil, nil, modelID, "user-1", nil,
+					&modelModule.APIConfig{}, nil,
+					func(*string, *string) error { return nil },
+				)
+			},
+		},
+		{
+			name:    "OCR file",
+			wantErr: "no such method",
+			call: func(service *ModelProviderService, modelID *string) (common.ErrorCode, error) {
+				_, code, err := service.OCRFile(
+					t.Context(), nil, nil, nil, modelID, "user-1", nil, nil,
+					&modelModule.APIConfig{}, nil,
+				)
+				return code, err
+			},
+		},
+		{
+			name:    "parse file",
+			wantErr: "no such method",
+			call: func(service *ModelProviderService, modelID *string) (common.ErrorCode, error) {
+				_, code, err := service.ParseFile(
+					t.Context(), nil, nil, nil, modelID, "user-1", nil, nil,
+					&modelModule.APIConfig{}, nil,
+				)
+				return code, err
+			},
+		},
+	}
+
+	service := NewModelProviderService()
+	modelID := custom.ID
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			code, err := test.call(service, &modelID)
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("operation error = %v, want %q", err, test.wantErr)
+			}
+			if code != common.CodeServerError {
+				t.Fatalf("code = %v, want %v", code, common.CodeServerError)
+			}
+		})
+	}
+}
+
+func TestEmbedTextRejectsInactiveAndWrongTypeCustomModels(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    string
+		modelType entity.ModelType
+		wantCode  common.ErrorCode
+		wantErr   string
+	}{
+		{
+			name:      "inactive embedding",
+			status:    "inactive",
+			modelType: entity.ModelTypeEmbedding,
+			wantCode:  common.CodeServerError,
+			wantErr:   "model is inactive",
+		},
+		{
+			name:      "active chat",
+			status:    "active",
+			modelType: entity.ModelTypeChat,
+			wantCode:  common.CodeNotFound,
+			wantErr:   "is an embedding model",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := setupModelProviderServiceTestDB(t)
+			useModelProviderServiceTestDB(t, db)
+			seedModelProviderServiceScope(t, db)
+			custom := &entity.TenantModel{
+				ID:         "custom-model",
+				ProviderID: "provider-1",
+				InstanceID: "instance-1",
+				ModelName:  "tenant-only-model",
+				ModelType:  int(tt.modelType),
+				Status:     tt.status,
+				Extra:      `{"max_dimension":1024,"max_batch_size":8,"dimensions":[1024]}`,
+			}
+			if err := db.Create(custom).Error; err != nil {
+				t.Fatalf("failed to seed custom model: %v", err)
+			}
+
+			modelID := custom.ID
+			_, code, err := NewModelProviderService().EmbedText(
+				t.Context(), nil, nil, nil, &modelID, "user-1", []string{"test"},
+				&modelModule.APIConfig{}, &modelModule.EmbeddingConfig{Dimension: 1024},
+			)
+			if code != tt.wantCode {
+				t.Fatalf("code = %v, want %v", code, tt.wantCode)
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("EmbedText() error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -419,7 +2875,84 @@ func TestModelProviderServiceAlterModelRejectsWrongScopedModelID(t *testing.T) {
 	}
 }
 
-func TestReconcileNvidiaInstanceModelsAddsUpdatesAndDeletes(t *testing.T) {
+func TestReconcileNvidiaInstanceModelsRejectsDuplicateExistingNamesWithoutMutation(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	provider := &entity.TenantModelProvider{
+		ID:           "provider-nvidia",
+		TenantID:     "tenant-1",
+		ProviderName: "NVIDIA",
+	}
+	instance := &entity.TenantModelInstance{
+		ID:           "instance-nvidia",
+		ProviderID:   provider.ID,
+		InstanceName: "default",
+		Status:       "active",
+		Extra:        "{}",
+	}
+	duplicates := []*entity.TenantModel{
+		{
+			ID:         "duplicate-a",
+			ProviderID: provider.ID,
+			InstanceID: instance.ID,
+			ModelName:  "nvidia/duplicate",
+			ModelType:  int(entity.ModelTypeChat),
+			Status:     "active",
+			Extra:      `{"slot":"a"}`,
+		},
+		{
+			ID:         "duplicate-b",
+			ProviderID: provider.ID,
+			InstanceID: instance.ID,
+			ModelName:  "nvidia/duplicate",
+			ModelType:  int(entity.ModelTypeEmbedding),
+			Status:     "inactive",
+			Extra:      `{"slot":"b"}`,
+		},
+	}
+	for _, row := range []interface{}{provider, instance, duplicates[0], duplicates[1]} {
+		if err := db.Create(row).Error; err != nil {
+			t.Fatalf("seed %T: %v", row, err)
+		}
+	}
+
+	err := NewModelProviderService().reconcileNvidiaInstanceModels(
+		t.Context(),
+		db,
+		provider,
+		instance,
+		[]modelModule.ListModelResponse{{
+			Name:       "nvidia/duplicate",
+			ModelTypes: []string{"chat", "vision"},
+		}},
+	)
+	if err == nil || !errors.Is(err, errDuplicateExistingModel) {
+		t.Fatalf(
+			"reconcileNvidiaInstanceModels() error = %v, want duplicate existing model error",
+			err,
+		)
+	}
+
+	var got []entity.TenantModel
+	if err := db.Where("provider_id = ? AND instance_id = ?", provider.ID, instance.ID).
+		Order("id").Find(&got).Error; err != nil {
+		t.Fatalf("reload models: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("model count = %d, want 2", len(got))
+	}
+	if got[0].ID != duplicates[0].ID ||
+		got[0].ModelType != duplicates[0].ModelType ||
+		got[0].Status != duplicates[0].Status ||
+		got[0].Extra != duplicates[0].Extra ||
+		got[1].ID != duplicates[1].ID ||
+		got[1].ModelType != duplicates[1].ModelType ||
+		got[1].Status != duplicates[1].Status ||
+		got[1].Extra != duplicates[1].Extra {
+		t.Fatalf("models after duplicate failure = %#v, want original rows", got)
+	}
+}
+
+func TestReconcileNvidiaInstanceModelsAddsUpdatesAndPreservesOmitted(t *testing.T) {
 	db := setupModelProviderServiceTestDB(t)
 	provider := &entity.TenantModelProvider{ID: "provider-nvidia", TenantID: "tenant-1", ProviderName: "NVIDIA"}
 	instance := &entity.TenantModelInstance{ID: "instance-nvidia", ProviderID: provider.ID, InstanceName: "default", APIKey: "nvapi-test", Status: "active", Extra: "{}"}
@@ -467,8 +3000,11 @@ func TestReconcileNvidiaInstanceModelsAddsUpdatesAndDeletes(t *testing.T) {
 	if err = db.Order("model_name").Find(&got).Error; err != nil {
 		t.Fatalf("list models: %v", err)
 	}
-	if len(got) != 2 || got[0].ModelName != "nvidia/keep" || got[1].ModelName != "nvidia/new-embed" {
-		t.Fatalf("models = %#v, want keep and new", got)
+	if len(got) != 3 ||
+		got[0].ModelName != "nvidia/keep" ||
+		got[1].ModelName != "nvidia/new-embed" ||
+		got[2].ModelName != "nvidia/stale" {
+		t.Fatalf("models = %#v, want keep, new, and preserved stale", got)
 	}
 	if got[0].ID != "keep-id" || got[0].Status != "inactive" {
 		t.Fatalf("retained model identity/status = %q/%q", got[0].ID, got[0].Status)
@@ -489,6 +3025,96 @@ func TestReconcileNvidiaInstanceModelsAddsUpdatesAndDeletes(t *testing.T) {
 	}
 	if newExtra["verify"] != entity.ModelVerifyUnknown || int(newExtra["max_dimension"].(float64)) != maxDimension {
 		t.Fatalf("new extra = %#v", newExtra)
+	}
+}
+
+func TestReconcileNvidiaInstanceModelsSkipsUnchangedUpdates(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	provider := &entity.TenantModelProvider{
+		ID:           "provider-nvidia",
+		TenantID:     "tenant-1",
+		ProviderName: "NVIDIA",
+	}
+	instance := &entity.TenantModelInstance{
+		ID:           "instance-nvidia",
+		ProviderID:   provider.ID,
+		InstanceName: "default",
+		Status:       "active",
+		Extra:        "{}",
+	}
+	existing := &entity.TenantModel{
+		ID:         "existing-id",
+		ProviderID: provider.ID,
+		InstanceID: instance.ID,
+		ModelName:  "nvidia/existing",
+		ModelType:  int(entity.ModelTypeEmbedding),
+		Status:     "active",
+		Extra:      `{}`,
+	}
+	for _, row := range []interface{}{provider, instance, existing} {
+		if err := db.Create(row).Error; err != nil {
+			t.Fatalf("seed %T: %v", row, err)
+		}
+	}
+	if err := db.Exec(`
+		CREATE TRIGGER ignore_unchanged_nvidia_update
+		BEFORE UPDATE ON tenant_model
+		WHEN NEW.model_type = OLD.model_type AND NEW.extra = OLD.extra
+		BEGIN
+			SELECT RAISE(IGNORE);
+		END
+	`).Error; err != nil {
+		t.Fatalf("create unchanged-update trigger: %v", err)
+	}
+
+	maxDimension := 2048
+	remote := []modelModule.ListModelResponse{{
+		Name:         existing.ModelName,
+		MaxOutput:    ptrService(8192),
+		MaxDimension: &maxDimension,
+		Dimensions:   []int{1024, 2048},
+		ModelTypes:   []string{"embedding"},
+	}}
+	service := NewModelProviderService()
+	if err := service.reconcileNvidiaInstanceModels(
+		t.Context(), db, provider, instance, remote,
+	); err != nil {
+		t.Fatalf("first reconcileNvidiaInstanceModels() error = %v", err)
+	}
+	if err := service.reconcileNvidiaInstanceModels(
+		t.Context(), db, provider, instance, remote,
+	); err != nil {
+		t.Fatalf("second reconcileNvidiaInstanceModels() error = %v", err)
+	}
+}
+
+func TestReconcileNvidiaInstanceModelsPreservesOmittedModels(t *testing.T) {
+	db := setupModelProviderServiceTestDB(t)
+	provider := &entity.TenantModelProvider{ID: "provider-nvidia", TenantID: "tenant-1", ProviderName: "NVIDIA"}
+	instance := &entity.TenantModelInstance{ID: "instance-nvidia", ProviderID: provider.ID, InstanceName: "default", Status: "active", Extra: "{}"}
+	omitted := &entity.TenantModel{
+		ID:         "omitted-id",
+		ProviderID: provider.ID,
+		InstanceID: instance.ID,
+		ModelName:  "nvidia/temporarily-omitted",
+		ModelType:  int(entity.ModelTypeChat),
+		Status:     "active",
+		Extra:      "{}",
+	}
+	for _, row := range []interface{}{provider, instance, omitted} {
+		if err := db.Create(row).Error; err != nil {
+			t.Fatalf("seed %T: %v", row, err)
+		}
+	}
+
+	remote := []modelModule.ListModelResponse{{Name: "nvidia/current", ModelTypes: []string{"chat"}}}
+	if err := NewModelProviderService().reconcileNvidiaInstanceModels(t.Context(), db, provider, instance, remote); err != nil {
+		t.Fatalf("reconcileNvidiaInstanceModels() error = %v", err)
+	}
+
+	var got entity.TenantModel
+	if err := db.Where("id = ?", omitted.ID).First(&got).Error; err != nil {
+		t.Fatalf("omitted model was deleted: %v", err)
 	}
 }
 

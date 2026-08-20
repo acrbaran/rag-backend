@@ -84,6 +84,94 @@ func decodeProviderHandlerResponse(t *testing.T, recorder *httptest.ResponseReco
 	return body
 }
 
+func TestProviderHandlerCreateProviderInstancePreservesConflictCode(t *testing.T) {
+	db := setupProviderHandlerTestDB(t)
+	useProviderHandlerTestDB(t, db)
+	seedProviderHandlerModel(t, db)
+
+	ctx, recorder := newProviderHandlerRequest(
+		t,
+		map[string]interface{}{
+			"instance_name": "new-instance",
+			"api_key":       "test-key",
+			"model_info": []map[string]interface{}{
+				{"model_name": "same-model", "model_type": []string{"chat"}},
+				{"model_name": "same-model", "model_type": []string{"embedding"}},
+			},
+		},
+		gin.Param{Key: "provider_id_or_name", Value: "OpenAI"},
+	)
+
+	NewProviderHandler(nil, service.NewModelProviderService()).CreateProviderInstance(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	body := decodeProviderHandlerResponse(t, recorder)
+	if common.ErrorCode(body["code"].(float64)) != common.CodeConflict {
+		t.Fatalf("code = %v, want %v", body["code"], common.CodeConflict)
+	}
+}
+
+func TestProviderHandlerCreateProviderInstancePreservesExistingInstanceConflictCode(t *testing.T) {
+	db := setupProviderHandlerTestDB(t)
+	useProviderHandlerTestDB(t, db)
+	seedProviderHandlerModel(t, db)
+
+	ctx, recorder := newProviderHandlerRequest(
+		t,
+		map[string]interface{}{
+			"instance_name": "default",
+			"api_key":       "test-key",
+			"model_info": []map[string]interface{}{
+				{"model_name": "new-model", "model_type": []string{"chat"}},
+			},
+		},
+		gin.Param{Key: "provider_id_or_name", Value: "OpenAI"},
+	)
+
+	NewProviderHandler(nil, service.NewModelProviderService()).CreateProviderInstance(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	body := decodeProviderHandlerResponse(t, recorder)
+	if common.ErrorCode(body["code"].(float64)) != common.CodeConflict {
+		t.Fatalf("code = %v, want %v", body["code"], common.CodeConflict)
+	}
+}
+
+func TestProviderHandlerCreateNameOnlyProviderInstancePreservesExistingInstanceConflictCode(t *testing.T) {
+	db := setupProviderHandlerTestDB(t)
+	useProviderHandlerTestDB(t, db)
+	seedProviderHandlerModel(t, db)
+	if err := db.Create(&entity.TenantModelInstance{
+		ID:           "instance-existing",
+		ProviderID:   "provider-1",
+		InstanceName: "existing-name",
+		Status:       "active",
+		Extra:        "{}",
+	}).Error; err != nil {
+		t.Fatalf("seed existing instance: %v", err)
+	}
+
+	ctx, recorder := newProviderHandlerRequest(
+		t,
+		map[string]interface{}{"instance_name": "existing-name"},
+		gin.Param{Key: "provider_id_or_name", Value: "OpenAI"},
+	)
+
+	NewProviderHandler(nil, service.NewModelProviderService()).CreateProviderInstance(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	body := decodeProviderHandlerResponse(t, recorder)
+	if common.ErrorCode(body["code"].(float64)) != common.CodeConflict {
+		t.Fatalf("code = %v, want %v; body=%s", body["code"], common.CodeConflict, recorder.Body.String())
+	}
+}
+
 func TestProviderHandlerAlterModelRejectsMissingModelSelector(t *testing.T) {
 	ctx, recorder := newProviderHandlerRequest(
 		t,

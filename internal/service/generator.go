@@ -292,6 +292,36 @@ var errorMarkerRE = regexp.MustCompile(`\*\*ERROR\*\*`)
 //   - User: "Output: "
 //
 // This matches rag/prompts/full_question_prompt.md rendered via Jinja2.
+const fullQuestionUserTurnLimit = 3
+
+func boundedFullQuestionMessages(messages []map[string]interface{}) []map[string]interface{} {
+	valid := make([]map[string]interface{}, 0, len(messages))
+	userIndexes := make([]int, 0, fullQuestionUserTurnLimit+1)
+	for _, message := range messages {
+		role, roleOK := message["role"].(string)
+		content, contentOK := message["content"].(string)
+		if !roleOK || !contentOK || (role != "user" && role != "assistant") {
+			continue
+		}
+		if role == "user" {
+			userIndexes = append(userIndexes, len(valid))
+		}
+		valid = append(valid, map[string]interface{}{
+			"role":    role,
+			"content": content,
+		})
+	}
+	if len(userIndexes) == 0 {
+		return nil
+	}
+
+	firstUser := 0
+	if len(userIndexes) > fullQuestionUserTurnLimit {
+		firstUser = len(userIndexes) - fullQuestionUserTurnLimit
+	}
+	return valid[userIndexes[firstUser]:]
+}
+
 func FullQuestion(
 	ctx context.Context,
 	chatModel *modelModule.ChatModel,
@@ -305,13 +335,11 @@ func FullQuestion(
 		return "", fmt.Errorf("FullQuestion: empty messages")
 	}
 
+	boundedMessages := boundedFullQuestionMessages(messages)
 	var convLines []string
-	for _, m := range messages {
-		role, _ := m["role"].(string)
-		if role != "user" && role != "assistant" {
-			continue
-		}
-		content, _ := m["content"].(string)
+	for _, message := range boundedMessages {
+		role := message["role"].(string)
+		content := message["content"].(string)
 		convLines = append(convLines, fmt.Sprintf("%s: %s", strings.ToUpper(role), content))
 	}
 	conv := strings.Join(convLines, "\n")

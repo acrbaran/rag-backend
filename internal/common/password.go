@@ -17,10 +17,13 @@
 package common
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
@@ -198,44 +201,123 @@ func DecryptPassword(encryptedPassword string) (string, error) {
 
 // LoadPrivateKey loads and decrypts the RSA private key from conf/private.pem
 func LoadPrivateKey() (*rsa.PrivateKey, error) {
-	// Read private key file
 	keyData, err := os.ReadFile("conf/private.pem")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read private key file: %w", err)
 	}
 
-	// Parse PEM block
 	block, _ := pem.Decode(keyData)
 	if block == nil {
 		return nil, errors.New("failed to decode PEM block")
 	}
 
-	// Decrypt the PEM block if it's encrypted
-	var privateKey interface{}
-	if block.Headers["Proc-Type"] == "4,ENCRYPTED" {
-		// Decrypt using password "Welcome"
-		decryptedData, err := x509.DecryptPEMBlock(block, []byte("Welcome"))
-		if err != nil {
-			return nil, fmt.Errorf("failed to decrypt private key: %w", err)
-		}
-
-		// Parse the decrypted key
-		privateKey, err = x509.ParsePKCS1PrivateKey(decryptedData)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse private key: %w", err)
-		}
-	} else {
-		// Not encrypted, parse directly
-		privateKey, err = x509.ParsePKCS1PrivateKey(block.Bytes)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse private key: %w", err)
-		}
+	var keyDER []byte
+	switch {
+	case block.Type == "ENCRYPTED PRIVATE KEY":
+		keyDER, err = decryptPKCS8PrivateKey(block.Bytes, []byte("Welcome"))
+	case block.Headers["Proc-Type"] == "4,ENCRYPTED":
+		keyDER, err = x509.DecryptPEMBlock(block, []byte("Welcome"))
+	default:
+		keyDER = block.Bytes
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt private key: %w", err)
 	}
 
+	if privateKey, parseErr := x509.ParsePKCS1PrivateKey(keyDER); parseErr == nil {
+		return privateKey, nil
+	}
+	privateKey, err := x509.ParsePKCS8PrivateKey(keyDER)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
+	}
 	rsaPrivateKey, ok := privateKey.(*rsa.PrivateKey)
 	if !ok {
-		return nil, errors.New("not an RSA private key")
+		return nil, errors.New("private key is not RSA")
+	}
+	return rsaPrivateKey, nil
+}
+
+type pkcs8AlgorithmIdentifier struct {
+	Algorithm  asn1.ObjectIdentifier
+	Parameters asn1.RawValue `asn1:"optional"`
+}
+
+type encryptedPKCS8PrivateKey struct {
+	EncryptionAlgorithm pkcs8AlgorithmIdentifier
+	EncryptedData       []byte
+}
+
+type pbes2Parameters struct {
+	KeyDerivationFunc pkcs8AlgorithmIdentifier
+	EncryptionScheme  pkcs8AlgorithmIdentifier
+}
+
+type pbkdf2Parameters struct {
+	Salt           asn1.RawValue
+	IterationCount int
+	KeyLength      int                      `asn1:"optional"`
+	PRF            pkcs8AlgorithmIdentifier `asn1:"optional"`
+}
+
+func decryptPKCS8PrivateKey(der, password []byte) ([]byte, error) {
+	var encrypted encryptedPKCS8PrivateKey
+	if _, err := asn1.Unmarshal(der, &encrypted); err != nil {
+		return nil, fmt.Errorf("decode encrypted PKCS#8: %w", err)
+	}
+	if !encrypted.EncryptionAlgorithm.Algorithm.Equal(asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 13}) {
+		return nil, fmt.Errorf("unsupported PKCS#8 encryption algorithm %s", encrypted.EncryptionAlgorithm.Algorithm.String())
 	}
 
-	return rsaPrivateKey, nil
+	var pbes2 pbes2Parameters
+	if _, err := asn1.Unmarshal(encrypted.EncryptionAlgorithm.Parameters.FullBytes, &pbes2); err != nil {
+		return nil, fmt.Errorf("decode PBES2 parameters: %w", err)
+	}
+	if !pbes2.KeyDerivationFunc.Algorithm.Equal(asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 12}) {
+		return nil, fmt.Errorf("unsupported PBES2 key derivation algorithm %s", pbes2.KeyDerivationFunc.Algorithm.String())
+	}
+	if !pbes2.EncryptionScheme.Algorithm.Equal(asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 42}) {
+		return nil, fmt.Errorf("unsupported PBES2 encryption scheme %s", pbes2.EncryptionScheme.Algorithm.String())
+	}
+
+	var kdf pbkdf2Parameters
+	if _, err := asn1.Unmarshal(pbes2.KeyDerivationFunc.Parameters.FullBytes, &kdf); err != nil {
+		return nil, fmt.Errorf("decode PBKDF2 parameters: %w", err)
+	}
+	var salt []byte
+	if _, err := asn1.Unmarshal(kdf.Salt.FullBytes, &salt); err != nil {
+		return nil, fmt.Errorf("decode PBKDF2 salt: %w", err)
+	}
+	if kdf.IterationCount <= 0 {
+		return nil, fmt.Errorf("invalid PBKDF2 iteration count %d", kdf.IterationCount)
+	}
+	keyLength := kdf.KeyLength
+	if keyLength == 0 {
+		keyLength = 32
+	}
+	key := pbkdf2.Key(password, salt, kdf.IterationCount, keyLength, sha256.New)
+
+	var iv []byte
+	if _, err := asn1.Unmarshal(pbes2.EncryptionScheme.Parameters.FullBytes, &iv); err != nil {
+		return nil, fmt.Errorf("decode AES IV: %w", err)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("create AES cipher: %w", err)
+	}
+	if len(iv) != block.BlockSize() || len(encrypted.EncryptedData) == 0 || len(encrypted.EncryptedData)%block.BlockSize() != 0 {
+		return nil, errors.New("invalid AES-CBC encrypted PKCS#8 data")
+	}
+	plaintext := make([]byte, len(encrypted.EncryptedData))
+	cipher.NewCBCDecrypter(block, iv).CryptBlocks(plaintext, encrypted.EncryptedData)
+	padding := int(plaintext[len(plaintext)-1])
+	if padding == 0 || padding > block.BlockSize() || padding > len(plaintext) {
+		return nil, errors.New("invalid PKCS#7 padding in encrypted PKCS#8 data")
+	}
+	for _, value := range plaintext[len(plaintext)-padding:] {
+		if int(value) != padding {
+			return nil, errors.New("invalid PKCS#7 padding in encrypted PKCS#8 data")
+		}
+	}
+	return plaintext[:len(plaintext)-padding], nil
 }

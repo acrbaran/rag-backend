@@ -21,6 +21,7 @@ import (
 	"ragflow/internal/entity"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // TenantModelProviderDAO tenant model provider data access object
@@ -40,6 +41,18 @@ func (dao *TenantModelProviderDAO) GetByID(ctx context.Context, db *gorm.DB, id 
 	var provider entity.TenantModelProvider
 	err := db.WithContext(ctx).Where("id = ?", id).First(&provider).Error
 	if err != nil {
+		return nil, err
+	}
+	return &provider, nil
+}
+
+func (dao *TenantModelProviderDAO) GetByIDAndTenantIDForUpdate(ctx context.Context, db *gorm.DB, id, tenantID string) (*entity.TenantModelProvider, error) {
+	var provider entity.TenantModelProvider
+	query := db.WithContext(ctx)
+	if db.Dialector.Name() != "sqlite" {
+		query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	if err := query.Where("id = ? AND tenant_id = ?", id, tenantID).First(&provider).Error; err != nil {
 		return nil, err
 	}
 	return &provider, nil

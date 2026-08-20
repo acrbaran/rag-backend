@@ -23,7 +23,10 @@ import (
 	"ragflow/internal/entity"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
+
+var ErrTenantModelInstanceExists = errors.New("tenant model instance already exists")
 
 // TenantModelInstanceDAO tenant model instance data access object
 type TenantModelInstanceDAO struct{}
@@ -34,23 +37,25 @@ func NewTenantModelInstanceDAO() *TenantModelInstanceDAO {
 }
 
 func (dao *TenantModelInstanceDAO) Create(ctx context.Context, db *gorm.DB, instance *entity.TenantModelInstance) error {
-	// begin tx and check if the same provider instance exists
-	tx := db.WithContext(ctx).Begin()
-	defer tx.Rollback()
 	var existingInstance entity.TenantModelInstance
-	err := tx.WithContext(ctx).Where("provider_id = ? AND instance_name = ?", instance.ProviderID, instance.InstanceName).First(&existingInstance).Error
+	err := db.WithContext(ctx).
+		Where(
+			"provider_id = ? AND instance_name = ?",
+			instance.ProviderID,
+			instance.InstanceName,
+		).
+		First(&existingInstance).Error
 	if err == nil {
-		return fmt.Errorf("instance %s already exists", instance.InstanceName)
+		return fmt.Errorf(
+			"%w: instance %s",
+			ErrTenantModelInstanceExists,
+			instance.InstanceName,
+		)
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
 	}
-	err = tx.WithContext(ctx).Create(instance).Error
-	if err != nil {
-		return err
-	}
-	tx.Commit()
-	return nil
+	return db.WithContext(ctx).Create(instance).Error
 }
 
 func (dao *TenantModelInstanceDAO) GetAllInstancesByProviderID(ctx context.Context, db *gorm.DB, providerID string) ([]*entity.TenantModelInstance, error) {
@@ -107,6 +112,18 @@ func (dao *TenantModelInstanceDAO) GetByID(ctx context.Context, db *gorm.DB, id 
 	return &instance, nil
 }
 
+func (dao *TenantModelInstanceDAO) GetByIDAndProviderIDForUpdate(ctx context.Context, db *gorm.DB, id, providerID string) (*entity.TenantModelInstance, error) {
+	var instance entity.TenantModelInstance
+	query := db.WithContext(ctx)
+	if db.Dialector.Name() != "sqlite" {
+		query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	if err := query.Where("id = ? AND provider_id = ?", id, providerID).First(&instance).Error; err != nil {
+		return nil, err
+	}
+	return &instance, nil
+}
+
 func (dao *TenantModelInstanceDAO) DeleteByProviderIDAndInstanceName(ctx context.Context, db *gorm.DB, providerID, instanceName string) (int64, error) {
 	result := db.WithContext(ctx).Unscoped().Where("provider_id = ? and instance_name = ?", providerID, instanceName).Delete(&entity.TenantModelInstance{})
 	return result.RowsAffected, result.Error
@@ -116,6 +133,14 @@ func (dao *TenantModelInstanceDAO) DeleteByProviderIDAndInstanceName(ctx context
 // Mirrors Python's TenantModelInstanceService.update_by_id.
 func (dao *TenantModelInstanceDAO) UpdateByID(ctx context.Context, db *gorm.DB, id string, updates map[string]interface{}) error {
 	return db.WithContext(ctx).Model(&entity.TenantModelInstance{}).Where("id = ?", id).Updates(updates).Error
+}
+
+func (dao *TenantModelInstanceDAO) UpdateByIDAndProviderID(ctx context.Context, db *gorm.DB, id, providerID string, updates map[string]interface{}) (int64, error) {
+	result := db.WithContext(ctx).
+		Model(&entity.TenantModelInstance{}).
+		Where("id = ? AND provider_id = ?", id, providerID).
+		Updates(updates)
+	return result.RowsAffected, result.Error
 }
 
 // DeleteByIDs deletes all instances whose id is in the given list.

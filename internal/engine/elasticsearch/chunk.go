@@ -1004,8 +1004,12 @@ func (e *Engine) Search(ctx context.Context, req *types.SearchRequest) (*types.S
 		}
 	}
 
-	// Build bool query from condition
-	boolQuery := buildBoolQueryFromCondition(req.Filter, req.KbIDs, isSkillIndex, isMemoryIndex)
+	// Build the immutable filter used by dense/KNN retrieval. Hybrid search also
+	// builds a lexical query below, but that query must not leak into the KNN
+	// filter: generic questions such as "summarize the document" often have no
+	// literal token match while still having a strong vector match.
+	knnFilterQuery := buildBoolQueryFromCondition(req.Filter, req.KbIDs, isSkillIndex, isMemoryIndex)
+	boolQuery := knnFilterQuery
 
 	// Extract vector_similarity_weight from FusionExpr
 	var matchText *types.MatchTextExpr
@@ -1051,6 +1055,10 @@ func (e *Engine) Search(ctx context.Context, req *types.SearchRequest) (*types.S
 	queryBody := make(map[string]interface{})
 
 	if matchText != nil {
+		// Use a separate condition tree because the lexical branch is mutated with
+		// a query_string must-clause. The KNN branch keeps only authorization,
+		// dataset and availability filters.
+		boolQuery = buildBoolQueryFromCondition(req.Filter, req.KbIDs, isSkillIndex, isMemoryIndex)
 		textQuery := buildQueryStringQuery(matchText, vectorSimilarityWeight, isSkillIndex, isMemoryIndex)
 		if boolQuery != nil {
 			if boolMap, ok := boolQuery["bool"].(map[string]interface{}); ok {
@@ -1099,7 +1107,7 @@ func (e *Engine) Search(ctx context.Context, req *types.SearchRequest) (*types.S
 			"k":              k,
 			"num_candidates": numCandidates,
 			"similarity":     similarity,
-			"filter":         boolQuery,
+			"filter":         knnFilterQuery,
 		}
 
 		queryBody["knn"] = knnQuery

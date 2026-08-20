@@ -107,6 +107,59 @@ type TenantListItem struct {
 	DeltaSeconds float64 `json:"delta_seconds"`
 }
 
+// TenantDetailResponse is the non-secret tenant management view.
+type TenantDetailResponse struct {
+	TenantID string  `json:"tenant_id"`
+	Name     *string `json:"name,omitempty"`
+	Role     string  `json:"role"`
+	Status   *string `json:"status,omitempty"`
+}
+
+// UpdateTenantRequest contains the only tenant field that may be changed by
+// the management surface. Model/provider settings remain on their dedicated
+// endpoints and public keys are never accepted here.
+type UpdateTenantRequest struct {
+	Name string `json:"name" binding:"required"`
+}
+
+// GetTenantDetail enforces membership before returning tenant metadata.
+func (s *TenantService) GetTenantDetail(ctx context.Context, userID, tenantID string) (*TenantDetailResponse, common.ErrorCode, error) {
+	if strings.TrimSpace(tenantID) == "" {
+		return nil, common.CodeArgumentError, fmt.Errorf("tenant_id is required")
+	}
+	relation, err := s.userTenantDAO.FilterByUserIDAndTenantID(ctx, dao.DB, userID, tenantID)
+	if err != nil || relation == nil {
+		return nil, common.CodeAuthenticationError, fmt.Errorf("no authorization")
+	}
+	tenant, err := s.tenantDAO.GetByID(ctx, dao.DB, tenantID)
+	if err != nil {
+		return nil, common.CodeDataError, fmt.Errorf("tenant not found")
+	}
+	return &TenantDetailResponse{TenantID: tenant.ID, Name: tenant.Name, Role: relation.Role, Status: tenant.Status}, common.CodeSuccess, nil
+}
+
+// UpdateTenant changes the tenant display name. Ownership is checked before
+// any database lookup so cross-tenant IDs cannot be used as an oracle.
+func (s *TenantService) UpdateTenant(ctx context.Context, userID, tenantID string, req *UpdateTenantRequest) (*TenantDetailResponse, common.ErrorCode, error) {
+	if userID != tenantID {
+		return nil, common.CodeAuthenticationError, fmt.Errorf("no authorization")
+	}
+	if req == nil {
+		return nil, common.CodeArgumentError, fmt.Errorf("request is required")
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" || len([]rune(name)) > 100 {
+		return nil, common.CodeArgumentError, fmt.Errorf("name must be between 1 and 100 characters")
+	}
+	if _, err := s.tenantDAO.GetByID(ctx, dao.DB, tenantID); err != nil {
+		return nil, common.CodeDataError, fmt.Errorf("tenant not found")
+	}
+	if err := s.tenantDAO.Update(ctx, dao.DB, tenantID, map[string]interface{}{"name": name}); err != nil {
+		return nil, common.CodeServerError, fmt.Errorf("failed to update tenant: %w", err)
+	}
+	return s.GetTenantDetail(ctx, userID, tenantID)
+}
+
 // TenantLLMService tenant LLM service
 // This service handles operations related to tenant-specific LLM configurations
 type TenantLLMService struct {
@@ -960,6 +1013,34 @@ func (s *TenantService) RemoveMember(ctx context.Context, userID, tenantID, targ
 	}
 	if err := s.userTenantDAO.DeleteByUserAndTenant(ctx, dao.DB, targetUserID, tenantID); err != nil {
 		return common.CodeServerError, fmt.Errorf("failed to remove member: %w", err)
+	}
+	return common.CodeSuccess, nil
+}
+
+// UpdateMemberRole changes an accepted member between normal and admin. The
+// owner relation is immutable and invitations must be accepted first.
+func (s *TenantService) UpdateMemberRole(ctx context.Context, userID, tenantID, targetUserID, role string) (common.ErrorCode, error) {
+	if userID != tenantID {
+		return common.CodeAuthenticationError, fmt.Errorf("no authorization")
+	}
+	if targetUserID == "" || targetUserID == tenantID {
+		return common.CodeArgumentError, fmt.Errorf("tenant owner role cannot be changed")
+	}
+	if role != TenantRoleNormal && role != TenantRoleAdmin {
+		return common.CodeArgumentError, fmt.Errorf("role must be normal or admin")
+	}
+	relation, err := s.userTenantDAO.FilterByUserIDAndTenantID(ctx, dao.DB, targetUserID, tenantID)
+	if err != nil || relation == nil {
+		return common.CodeDataError, fmt.Errorf("active membership not found")
+	}
+	if relation.Role == TenantRoleInvite {
+		return common.CodeArgumentError, fmt.Errorf("invitation must be accepted before changing role")
+	}
+	if relation.Role == TenantRoleOwner {
+		return common.CodeArgumentError, fmt.Errorf("tenant owner role cannot be changed")
+	}
+	if err := s.userTenantDAO.UpdateRoleByUserAndTenant(ctx, dao.DB, targetUserID, tenantID, role); err != nil {
+		return common.CodeServerError, fmt.Errorf("failed to update member role: %w", err)
 	}
 	return common.CodeSuccess, nil
 }

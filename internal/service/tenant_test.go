@@ -133,6 +133,87 @@ func TestTenantRoleConstants(t *testing.T) {
 	}
 }
 
+func TestGetTenantDetailRejectsCrossTenantIDOR(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{TranslateError: true})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if err = db.AutoMigrate(&entity.UserTenant{}); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	originalDB := dao.DB
+	dao.DB = db
+	t.Cleanup(func() { dao.DB = originalDB })
+
+	s := NewTenantService()
+	_, code, err := s.GetTenantDetail(t.Context(), "attacker", "victim-tenant")
+	if err == nil || code != common.CodeAuthenticationError {
+		t.Fatalf("GetTenantDetail() code = %v, err = %v; want authentication error", code, err)
+	}
+}
+
+func TestUpdateTenantRejectsNonOwnerBeforeDatabaseAccess(t *testing.T) {
+	s := &TenantService{}
+	_, code, err := s.UpdateTenant(t.Context(), "member", "owner", &UpdateTenantRequest{Name: "Changed"})
+	if err == nil || code != common.CodeAuthenticationError {
+		t.Fatalf("UpdateTenant() code = %v, err = %v; want authentication error", code, err)
+	}
+}
+
+func TestUpdateMemberRoleRejectsOwnerAndInvalidRole(t *testing.T) {
+	s := &TenantService{}
+	if code, err := s.UpdateMemberRole(t.Context(), "owner", "owner", "owner", TenantRoleAdmin); err == nil || code != common.CodeArgumentError {
+		t.Fatalf("owner role update code = %v, err = %v", code, err)
+	}
+	if code, err := s.UpdateMemberRole(t.Context(), "owner", "owner", "member", "superuser"); err == nil || code != common.CodeArgumentError {
+		t.Fatalf("invalid role update code = %v, err = %v", code, err)
+	}
+}
+
+func TestTenantManagementDetailUpdateAndRole(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{TranslateError: true})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if err = db.AutoMigrate(&entity.Tenant{}, &entity.UserTenant{}); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	originalDB := dao.DB
+	dao.DB = db
+	t.Cleanup(func() { dao.DB = originalDB })
+
+	status := "1"
+	name := "Original"
+	if err = db.Create(&entity.Tenant{ID: "owner", Name: &name, LLMID: "", EmbdID: "", ASRID: "", Img2TxtID: "", RerankID: "", ParserIDs: "", Status: &status}).Error; err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	for _, relation := range []*entity.UserTenant{
+		{ID: "ut-owner", UserID: "owner", TenantID: "owner", Role: TenantRoleOwner, Status: &status},
+		{ID: "ut-member", UserID: "member", TenantID: "owner", Role: TenantRoleNormal, Status: &status},
+	} {
+		if err = db.Create(relation).Error; err != nil {
+			t.Fatalf("create membership: %v", err)
+		}
+	}
+
+	s := NewTenantService()
+	detail, code, err := s.GetTenantDetail(t.Context(), "member", "owner")
+	if err != nil || code != common.CodeSuccess || detail.Role != TenantRoleNormal {
+		t.Fatalf("member detail = %+v, code = %v, err = %v", detail, code, err)
+	}
+	updated, code, err := s.UpdateTenant(t.Context(), "owner", "owner", &UpdateTenantRequest{Name: "  Rag Platform Team  "})
+	if err != nil || code != common.CodeSuccess || updated.Name == nil || *updated.Name != "Rag Platform Team" {
+		t.Fatalf("updated tenant = %+v, code = %v, err = %v", updated, code, err)
+	}
+	if code, err = s.UpdateMemberRole(t.Context(), "owner", "owner", "member", TenantRoleAdmin); err != nil || code != common.CodeSuccess {
+		t.Fatalf("promote member code = %v, err = %v", code, err)
+	}
+	var membership entity.UserTenant
+	if err = db.Where("user_id = ? AND tenant_id = ?", "member", "owner").First(&membership).Error; err != nil || membership.Role != TenantRoleAdmin {
+		t.Fatalf("membership = %+v, err = %v", membership, err)
+	}
+}
+
 // TestSetTenantDefaultModels_WithModelID verifies that SetTenantDefaultModels
 // correctly resolves a modelID to composite name, validates ownership, and updates the tenant.
 func TestSetTenantDefaultModels_WithModelID(t *testing.T) {

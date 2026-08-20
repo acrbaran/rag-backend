@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"ragflow/internal/common"
 	"ragflow/internal/server/config"
+	"sort"
 	"strings"
 	"time"
 
@@ -268,17 +269,24 @@ func GetAllConfigs() ([]map[string]interface{}, error) {
 	return allConfigs, nil
 }
 
-// PrintAll prints all configuration settings
+func safeConfigLogMetadata(v *viper.Viper) []string {
+	keys := make([]string, 0, len(v.AllSettings()))
+	for key := range v.AllSettings() {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// PrintAll prints configuration section names without values.
 func PrintAll() {
 	if globalViper == nil {
 		common.Info("Configuration not initialized")
 		return
 	}
 
-	allSettings := globalViper.AllSettings()
-	common.Info("=== All Configurations ===")
-	for key, value := range allSettings {
-		common.Info("config", zap.String("key", key), zap.Any("value", value))
-	}
-	common.Info("=== End Configurations ===")
+	keys := safeConfigLogMetadata(globalViper)
+	common.Info("Configuration loaded",
+		zap.Int("section_count", len(keys)),
+		zap.Strings("sections", keys))
 }

@@ -1,0 +1,50 @@
+name: Rag Platform governance
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: rag-platform-governance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  phase-0-gate:
+    name: Phase 0 gate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out backend
+        uses: actions/checkout@v6
+
+      - name: Reject committed runtime keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e conf/private.pem
+          test ! -e conf/public.pem
+          matches="$(git grep -l 'BEGIN PRIVATE KEY' -- . || true)"
+          unexpected="$(printf '%s\n' "$matches" | grep -v '^internal/agent/sandbox/ssh_test.go$' || true)"
+          test -z "$unexpected"
+
+      - name: Check required attribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s LICENSE
+          git diff --check HEAD
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out backend
+        uses: actions/checkout@v6
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@v4

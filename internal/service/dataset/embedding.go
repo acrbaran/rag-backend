@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"sort"
 	"strings"
 
 	"ragflow/internal/common"
@@ -19,6 +18,10 @@ import (
 
 // embeddingCheckSample is one sampled chunk with its stored vector, used by the
 // embedding availability check.
+var errInsufficientEmbeddingSamples = errors.New(
+	"insufficient valid chunks with vectors",
+)
+
 type embeddingCheckSample struct {
 	ChunkID           string
 	KbID              string
@@ -31,6 +34,8 @@ type embeddingCheckSample struct {
 	Top               interface{}
 	ContentWithWeight string
 	QuestionKeywords  []string
+	TitleTokens       string
+	ContentTokens     string
 }
 
 // CheckEmbedding verifies that a candidate embedding model is compatible with a
@@ -76,6 +81,9 @@ func (d *DatasetService) CheckEmbedding(ctx context.Context, userID, datasetID s
 
 	samples, err := d.sampleRandomChunksWithVectors(ctx, kb.TenantID, datasetID, checkNum)
 	if err != nil {
+		if errors.Is(err, errInsufficientEmbeddingSamples) {
+			return nil, common.CodeDataError, err
+		}
 		return nil, common.CodeServerError, err
 	}
 	if len(samples) == 0 {
@@ -85,25 +93,19 @@ func (d *DatasetService) CheckEmbedding(ctx context.Context, userID, datasetID s
 		}, common.CodeSuccess, nil
 	}
 
-	results := make([]service.EmbeddingCheckResult, 0, len(samples))
-	effectiveSimilarities := make([]float64, 0, len(samples))
+	type embeddingComparison struct {
+		sample  embeddingCheckSample
+		vectors [][]float64
+	}
+	comparisons := make([]embeddingComparison, 0, len(samples))
 	sawTitleAndContent := false
 	for _, sample := range samples {
 		if sample.Vector == nil || len(sample.Vector) == 0 {
 			continue
 		}
 
-		rawChunk, err := d.docEngine.GetChunk(ctx, fmt.Sprintf("ragflow_%s", kb.TenantID), sample.ChunkID, []string{datasetID})
-		if err != nil {
-			continue
-		}
-		chunkMap := datasetMap(rawChunk)
-		if len(chunkMap) == 0 {
-			continue
-		}
-
-		title := datasetString(chunkMap["title_tks"])
-		content := datasetString(chunkMap["content_ltks"])
+		title := sample.TitleTokens
+		content := sample.ContentTokens
 
 		var titleVector [][]float64
 		if title != "" {
@@ -132,10 +134,55 @@ func (d *DatasetService) CheckEmbedding(ctx context.Context, userID, datasetID s
 			continue
 		}
 
-		if len(vectors[0]) != len(sample.Vector) {
-			return nil, common.CodeDataError, fmt.Errorf("Embedding failure. The dimension (%d) of given embedding model is different from the original (%d)", len(vectors[0]), len(sample.Vector))
+		if len(vectors) == 2 && len(vectors[0]) != len(vectors[1]) {
+			return nil, common.CodeServerError, fmt.Errorf(
+				"embedding response dimensions do not match: %d and %d",
+				len(vectors[0]),
+				len(vectors[1]),
+			)
 		}
+		comparisons = append(comparisons, embeddingComparison{
+			sample:  sample,
+			vectors: vectors,
+		})
+	}
 
+	if len(comparisons) == 0 {
+		return nil, common.CodeDataError, errors.New("No embedded chunks are available to compare.")
+	}
+	expectedStoredDimension := len(comparisons[0].sample.Vector)
+	expectedProviderDimension := len(comparisons[0].vectors[0])
+	for _, comparison := range comparisons[1:] {
+		storedDimension := len(comparison.sample.Vector)
+		if storedDimension != expectedStoredDimension {
+			return nil, common.CodeDataError, fmt.Errorf(
+				"stored vector dimension changed from %d to %d",
+				expectedStoredDimension,
+				storedDimension,
+			)
+		}
+		providerDimension := len(comparison.vectors[0])
+		if providerDimension != expectedProviderDimension {
+			return nil, common.CodeServerError, fmt.Errorf(
+				"provider embedding dimension changed from %d to %d",
+				expectedProviderDimension,
+				providerDimension,
+			)
+		}
+	}
+	if expectedProviderDimension != expectedStoredDimension {
+		return nil, common.CodeDataError, fmt.Errorf(
+			"embedding model dimension %d does not match stored dimension %d",
+			expectedProviderDimension,
+			expectedStoredDimension,
+		)
+	}
+
+	results := make([]service.EmbeddingCheckResult, 0, len(comparisons))
+	effectiveSimilarities := make([]float64, 0, len(comparisons))
+	for _, comparison := range comparisons {
+		sample := comparison.sample
+		vectors := comparison.vectors
 		var sim float64
 		if len(vectors) == 2 {
 			simContent := datasetCosSim(vectors[1], sample.Vector)
@@ -167,11 +214,8 @@ func (d *DatasetService) CheckEmbedding(ctx context.Context, userID, datasetID s
 	if sawTitleAndContent {
 		matchMode = "title_and_content"
 	}
-	summary := datasetEmbeddingCheckSummary(datasetID, embeddingID, len(samples), effectiveSimilarities, matchMode)
+	summary := datasetEmbeddingCheckSummary(datasetID, embeddingID, len(comparisons), effectiveSimilarities, matchMode)
 	response := &service.EmbeddingCheckResponse{Summary: summary, Results: results}
-	if len(effectiveSimilarities) == 0 {
-		return nil, common.CodeDataError, errors.New("No embedded chunks are available to compare.")
-	}
 	if summary.AvgCosSim >= 0.9 {
 		return response, common.CodeSuccess, nil
 	}
@@ -193,8 +237,21 @@ func (d *DatasetService) sampleRandomChunksWithVectors(ctx context.Context, tena
 	if err != nil {
 		return nil, err
 	}
-	if totalResult == nil || totalResult.Total <= 0 {
-		return []embeddingCheckSample{}, nil
+	if totalResult == nil {
+		return nil, errors.New("embedding sample count returned empty search response")
+	}
+	if totalResult.Total < 0 {
+		return nil, fmt.Errorf(
+			"embedding sample count returned negative total: %d",
+			totalResult.Total,
+		)
+	}
+	if totalResult.Total == 0 {
+		return nil, fmt.Errorf(
+			"%w: found 0 of %d",
+			errInsufficientEmbeddingSamples,
+			n,
+		)
 	}
 
 	total := int(totalResult.Total)
@@ -218,12 +275,13 @@ func (d *DatasetService) sampleRandomChunksWithVectors(ctx context.Context, tena
 		n = limit
 	}
 	offsets := rand.Perm(limit)
-	offsets = offsets[:n]
-	sort.Ints(offsets)
 
 	baseFields := []string{"docnm_kwd", "doc_id", "content_with_weight", "page_num_int", "position_int", "top_int"}
 	samples := make([]embeddingCheckSample, 0, n)
 	for _, offset := range offsets {
+		if len(samples) == n {
+			break
+		}
 		searchResult, err := d.docEngine.Search(ctx, &enginetypes.SearchRequest{
 			IndexNames:   []string{indexName},
 			KbIDs:        []string{datasetID},
@@ -238,23 +296,61 @@ func (d *DatasetService) sampleRandomChunksWithVectors(ctx context.Context, tena
 		if err != nil {
 			return nil, err
 		}
-		if searchResult == nil || len(searchResult.Chunks) == 0 {
-			continue
+		if searchResult == nil {
+			return nil, fmt.Errorf(
+				"embedding sample offset %d returned empty search response",
+				offset,
+			)
+		}
+		if len(searchResult.Chunks) == 0 {
+			return nil, fmt.Errorf(
+				"embedding sample offset %d returned no chunk",
+				offset,
+			)
 		}
 		chunkID := datasetChunkID(searchResult.Chunks[0])
 		if chunkID == "" {
-			continue
+			return nil, fmt.Errorf(
+				"embedding sample offset %d returned chunk missing chunk ID",
+				offset,
+			)
 		}
 		fullChunk, err := d.docEngine.GetChunk(ctx, indexName, chunkID, []string{datasetID})
 		if err != nil {
 			return nil, err
 		}
+		if fullChunk == nil {
+			return nil, fmt.Errorf(
+				"embedding sample chunk not found: %s",
+				chunkID,
+			)
+		}
 		chunkMap := datasetMap(fullChunk)
+		if chunkMap == nil {
+			return nil, fmt.Errorf(
+				"embedding sample chunk %s returned malformed chunk response",
+				chunkID,
+			)
+		}
 		if len(chunkMap) == 0 {
-			continue
+			return nil, fmt.Errorf(
+				"embedding sample chunk %s returned empty chunk response",
+				chunkID,
+			)
 		}
 		vectorField := datasetGuessVecField(chunkMap)
+		if vectorField == "" {
+			continue
+		}
 		vector := datasetAsFloatVec(chunkMap[vectorField])
+		if len(vector) == 0 {
+			continue
+		}
+		titleTokens := datasetString(chunkMap["title_tks"])
+		contentTokens := datasetString(chunkMap["content_ltks"])
+		if strings.TrimSpace(titleTokens) == "" && strings.TrimSpace(contentTokens) == "" {
+			continue
+		}
 		samples = append(samples, embeddingCheckSample{
 			ChunkID:           chunkID,
 			KbID:              datasetID,
@@ -267,11 +363,18 @@ func (d *DatasetService) sampleRandomChunksWithVectors(ctx context.Context, tena
 			Top:               chunkMap["top_int"],
 			ContentWithWeight: datasetString(chunkMap["content_with_weight"]),
 			QuestionKeywords:  datasetStringSlice(chunkMap["question_keywords"]),
+			TitleTokens:       titleTokens,
+			ContentTokens:     contentTokens,
 		})
 	}
 
-	if len(samples) == 0 {
-		return nil, errors.New("no valid chunks with vectors found")
+	if len(samples) != n {
+		return nil, fmt.Errorf(
+			"%w: found %d of %d",
+			errInsufficientEmbeddingSamples,
+			len(samples),
+			n,
+		)
 	}
 	return samples, nil
 }

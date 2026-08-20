@@ -172,6 +172,41 @@ func (h *TenantHandler) TenantList(c *gin.Context) {
 	common.SuccessWithData(c, tenantList, "success")
 }
 
+// GetTenant returns one tenant only when the caller has an active membership.
+func (h *TenantHandler) GetTenant(c *gin.Context) {
+	user, errorCode, errorMessage := GetUser(c)
+	if errorCode != common.CodeSuccess {
+		common.ErrorWithCode(c, errorCode, errorMessage)
+		return
+	}
+	tenant, code, err := h.tenantService.GetTenantDetail(c.Request.Context(), user.ID, c.Param("tenant_id"))
+	if err != nil {
+		common.ResponseWithCodeData(c, code, nil, err.Error())
+		return
+	}
+	common.SuccessWithData(c, tenant, "success")
+}
+
+// UpdateTenant updates the display name. Only the tenant owner may mutate it.
+func (h *TenantHandler) UpdateTenant(c *gin.Context) {
+	user, errorCode, errorMessage := GetUser(c)
+	if errorCode != common.CodeSuccess {
+		common.ErrorWithCode(c, errorCode, errorMessage)
+		return
+	}
+	var req service.UpdateTenantRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ResponseWithHttpCodeData(c, http.StatusBadRequest, common.CodeBadRequest, nil, "invalid request body: "+err.Error())
+		return
+	}
+	tenant, code, err := h.tenantService.UpdateTenant(c.Request.Context(), user.ID, c.Param("tenant_id"), &req)
+	if err != nil {
+		common.ResponseWithCodeData(c, code, nil, err.Error())
+		return
+	}
+	common.SuccessWithData(c, tenant, "success")
+}
+
 // CreateMetadataStore handles the create metadata store request
 // @Summary Create Metadata Store
 // @Description Create the metadata store for a tenant
@@ -568,6 +603,30 @@ func (h *TenantHandler) RemoveTenantMember(c *gin.Context) {
 
 	ctx := c.Request.Context()
 	code, err := h.tenantService.RemoveMember(ctx, user.ID, tenantID, body.UserID)
+	if err != nil {
+		common.ResponseWithCodeData(c, code, nil, err.Error())
+		return
+	}
+	common.SuccessWithData(c, true, "success")
+}
+
+// UpdateTenantMemberRole promotes or demotes an accepted tenant member.
+func (h *TenantHandler) UpdateTenantMemberRole(c *gin.Context) {
+	user, errorCode, errorMessage := GetUser(c)
+	if errorCode != common.CodeSuccess {
+		common.ErrorWithCode(c, errorCode, errorMessage)
+		return
+	}
+	var body struct {
+		Role string `json:"role" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		common.ResponseWithHttpCodeData(c, http.StatusBadRequest, common.CodeBadRequest, nil, "role is required")
+		return
+	}
+	code, err := h.tenantService.UpdateMemberRole(
+		c.Request.Context(), user.ID, c.Param("tenant_id"), c.Param("user_id"), body.Role,
+	)
 	if err != nil {
 		common.ResponseWithCodeData(c, code, nil, err.Error())
 		return

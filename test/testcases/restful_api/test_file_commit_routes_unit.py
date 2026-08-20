@@ -670,6 +670,56 @@ def test_get_uncommitted_changes(monkeypatch):
     assert f2_changes[0]["operation"] == "add"
 
 
+def test_get_uncommitted_changes_detects_rename_and_move(monkeypatch):
+    module = _load_module(monkeypatch)
+    FileTestModel.create(
+        id="other-folder",
+        parent_id="root-folder",
+        tenant_id="t1",
+        created_by="test-user",
+        name="Other",
+        type="folder",
+    )
+    FileTestModel.create(
+        id="f1",
+        parent_id="root-folder",
+        tenant_id="t1",
+        created_by="test-user",
+        name="old.txt",
+        type="txt",
+    )
+
+    _setup_request(
+        module,
+        json_payload={
+            "message": "baseline",
+            "files": [
+                {
+                    "file_id": "f1",
+                    "file_name": "old.txt",
+                    "operation": "add",
+                    "content": "hello",
+                }
+            ],
+        },
+    )
+    _run(module.create_commit("root-folder"))
+
+    FileTestModel.update(name="new.txt", parent_id="other-folder").where(
+        FileTestModel.id == "f1"
+    ).execute()
+
+    res = _run(module.get_uncommitted_changes("root-folder"))
+    assert res["code"] == 0
+    changes = [change for change in res["data"] if change["file_id"] == "f1"]
+    by_operation = {change["operation"]: change for change in changes}
+    assert {"rename", "move"}.issubset(by_operation)
+    assert by_operation["rename"]["old_name"] == "old.txt"
+    assert by_operation["rename"]["new_name"] == "new.txt"
+    assert by_operation["move"]["old_parent_id"] == "root-folder"
+    assert by_operation["move"]["new_parent_id"] == "other-folder"
+
+
 @pytest.mark.p2
 def test_get_commit_tree(monkeypatch):
     module = _load_module(monkeypatch)

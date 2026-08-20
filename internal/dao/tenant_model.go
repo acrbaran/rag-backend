@@ -21,6 +21,7 @@ import (
 	"ragflow/internal/entity"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // TenantModelDAO tenant model data access object
@@ -70,8 +71,11 @@ func (dao *TenantModelDAO) DeleteByProviderIDAndInstanceIDAndModelName(ctx conte
 	return result.RowsAffected, result.Error
 }
 
-func (dao *TenantModelDAO) UpdateStatusByIDAndScope(ctx context.Context, db *gorm.DB, modelID, providerID, instanceID, status string) (int64, error) {
-	result := db.WithContext(ctx).Model(&entity.TenantModel{}).Where("id = ? AND provider_id = ? AND instance_id = ?", modelID, providerID, instanceID).Update("status", status)
+func (dao *TenantModelDAO) UpdateByIDAndScope(ctx context.Context, db *gorm.DB, modelID, providerID, instanceID string, updates map[string]interface{}) (int64, error) {
+	result := db.WithContext(ctx).
+		Model(&entity.TenantModel{}).
+		Where("id = ? AND provider_id = ? AND instance_id = ?", modelID, providerID, instanceID).
+		Updates(updates)
 	return result.RowsAffected, result.Error
 }
 
@@ -124,6 +128,18 @@ func (dao *TenantModelDAO) GetModelsByInstanceID(ctx context.Context, db *gorm.D
 	return models, nil
 }
 
+func (dao *TenantModelDAO) GetModelsByProviderIDAndInstanceIDForUpdate(ctx context.Context, db *gorm.DB, providerID, instanceID string) ([]*entity.TenantModel, error) {
+	var models []*entity.TenantModel
+	query := db.WithContext(ctx)
+	if db.Dialector.Name() != "sqlite" {
+		query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	if err := query.Where("provider_id = ? AND instance_id = ?", providerID, instanceID).Find(&models).Error; err != nil {
+		return nil, err
+	}
+	return models, nil
+}
+
 // DeleteByIDs deletes all models whose id is in the given list.
 // Mirrors Python's TenantModelService.delete_by_ids.
 func (dao *TenantModelDAO) DeleteByIDs(ctx context.Context, db *gorm.DB, ids []string) (int64, error) {
@@ -131,6 +147,17 @@ func (dao *TenantModelDAO) DeleteByIDs(ctx context.Context, db *gorm.DB, ids []s
 		return 0, nil
 	}
 	result := db.WithContext(ctx).Unscoped().Where("id IN ?", ids).Delete(&entity.TenantModel{})
+	return result.RowsAffected, result.Error
+}
+
+func (dao *TenantModelDAO) DeleteByIDsAndScope(ctx context.Context, db *gorm.DB, ids []string, providerID, instanceID string) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	result := db.WithContext(ctx).
+		Unscoped().
+		Where("id IN ? AND provider_id = ? AND instance_id = ?", ids, providerID, instanceID).
+		Delete(&entity.TenantModel{})
 	return result.RowsAffected, result.Error
 }
 

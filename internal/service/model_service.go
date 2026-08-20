@@ -409,6 +409,98 @@ func (m *ModelProviderService) ListSupportedModels(ctx context.Context, provider
 	return result, nil
 }
 
+func (m *ModelProviderService) listRemoteModelNames(
+	ctx context.Context,
+	provider *entity.TenantModelProvider,
+	instance *entity.TenantModelInstance,
+) ([]string, error) {
+	if provider == nil {
+		return nil, errors.New("provider is required for remote model normalization")
+	}
+	if instance == nil {
+		return nil, errors.New("instance is required for remote model normalization")
+	}
+	providerInfo := dao.GetModelProviderManager().FindProvider(provider.ProviderName)
+	if providerInfo == nil {
+		return nil, fmt.Errorf("provider %q driver not found", provider.ProviderName)
+	}
+
+	extra := make(map[string]string)
+	if instance.Extra != "" {
+		if err := json.Unmarshal([]byte(instance.Extra), &extra); err != nil {
+			return nil, fmt.Errorf("invalid instance metadata: %w", err)
+		}
+	}
+	region := extra["region"]
+	baseURL := extra["base_url"]
+	apiConfig := &modelModule.APIConfig{
+		ApiKey:  &instance.APIKey,
+		Region:  &region,
+		BaseURL: &baseURL,
+	}
+	driver, err := newModelDriverForBaseURL(
+		providerInfo.ModelDriver,
+		provider.ProviderName,
+		region,
+		baseURL,
+	)
+	if err != nil {
+		return nil, err
+	}
+	remoteModels, err := driver.ListModels(ctx, apiConfig)
+	if err != nil {
+		return nil, fmt.Errorf("list remote models: %w", err)
+	}
+	listedNames := make([]string, 0, len(remoteModels))
+	for _, remote := range remoteModels {
+		name := strings.TrimSpace(remote.Name)
+		if name != "" {
+			listedNames = append(listedNames, name)
+		}
+	}
+	if len(listedNames) == 0 {
+		return nil, errors.New("remote model catalog returned no usable models")
+	}
+	return listedNames, nil
+}
+
+func normalizeModelNameAgainstListedCatalog(
+	requested string,
+	listedNames []string,
+) (string, bool, error) {
+	normalized, changed := normalizeListedModelName(requested, listedNames)
+	if changed || normalized != requested {
+		return normalized, changed, nil
+	}
+	for _, listedName := range listedNames {
+		if listedName == requested {
+			return normalized, false, nil
+		}
+	}
+	return requested, false, fmt.Errorf(
+		"%w: model %q not found in remote model catalog",
+		errRemoteModelNotFound,
+		requested,
+	)
+}
+
+func (m *ModelProviderService) normalizeModelNameAgainstRemoteCatalog(
+	ctx context.Context,
+	provider *entity.TenantModelProvider,
+	instance *entity.TenantModelInstance,
+	requested string,
+) (string, bool, error) {
+	requested = strings.TrimSpace(requested)
+	if !strings.HasSuffix(requested, "@openai") {
+		return requested, false, nil
+	}
+	listedNames, err := m.listRemoteModelNames(ctx, provider, instance)
+	if err != nil {
+		return requested, false, err
+	}
+	return normalizeModelNameAgainstListedCatalog(requested, listedNames)
+}
+
 func (m *ModelProviderService) reconcileNvidiaInstanceModels(
 	ctx context.Context,
 	db *gorm.DB,
@@ -441,12 +533,51 @@ func (m *ModelProviderService) reconcileNvidiaInstanceModels(
 	}
 
 	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		existingModels, err := m.modelDAO.GetModelsByInstanceID(ctx, tx, instance.ID)
+		lockedProvider, err := m.modelProviderDAO.GetByIDAndTenantIDForUpdate(
+			ctx,
+			tx,
+			provider.ID,
+			provider.TenantID,
+		)
+		if err != nil {
+			return fmt.Errorf("fail to lock NVIDIA provider: %w", err)
+		}
+		if lockedProvider.ProviderName != provider.ProviderName {
+			return errors.New("NVIDIA provider changed during discovery")
+		}
+		lockedInstance, err := m.modelInstanceDAO.GetByIDAndProviderIDForUpdate(
+			ctx,
+			tx,
+			instance.ID,
+			provider.ID,
+		)
+		if err != nil {
+			return fmt.Errorf("fail to lock NVIDIA model instance: %w", err)
+		}
+		if lockedInstance.InstanceName != instance.InstanceName ||
+			lockedInstance.APIKey != instance.APIKey ||
+			lockedInstance.Status != instance.Status ||
+			lockedInstance.Extra != instance.Extra {
+			return errors.New("NVIDIA model instance changed during discovery")
+		}
+		existingModels, err := m.modelDAO.GetModelsByProviderIDAndInstanceIDForUpdate(
+			ctx,
+			tx,
+			provider.ID,
+			instance.ID,
+		)
 		if err != nil {
 			return err
 		}
 		existingByName := make(map[string]*entity.TenantModel, len(existingModels))
 		for _, existing := range existingModels {
+			if _, exists := existingByName[existing.ModelName]; exists {
+				return fmt.Errorf(
+					"%w %q",
+					errDuplicateExistingModel,
+					existing.ModelName,
+				)
+			}
 			existingByName[existing.ModelName] = existing
 		}
 
@@ -469,11 +600,30 @@ func (m *ModelProviderService) reconcileNvidiaInstanceModels(
 				if err != nil {
 					return fmt.Errorf("encode metadata for NVIDIA model %q: %w", remote.Name, err)
 				}
-				if err = m.modelDAO.UpdateByID(ctx, tx, existing.ID, map[string]interface{}{
-					"model_type": modelType,
-					"extra":      string(extraBytes),
-				}); err != nil {
+				if existing.ModelType == modelType &&
+					existing.Extra == string(extraBytes) {
+					delete(existingByName, remote.Name)
+					continue
+				}
+				rows, err := m.modelDAO.UpdateByIDAndScope(
+					ctx,
+					tx,
+					existing.ID,
+					provider.ID,
+					instance.ID,
+					map[string]interface{}{
+						"model_type": modelType,
+						"extra":      string(extraBytes),
+					},
+				)
+				if err != nil {
 					return err
+				}
+				if rows != 1 {
+					return fmt.Errorf(
+						"NVIDIA model update updated %d rows, want 1",
+						rows,
+					)
 				}
 				delete(existingByName, remote.Name)
 				continue
@@ -498,15 +648,6 @@ func (m *ModelProviderService) reconcileNvidiaInstanceModels(
 			}
 		}
 
-		staleIDs := make([]string, 0, len(existingByName))
-		for _, stale := range existingByName {
-			staleIDs = append(staleIDs, stale.ID)
-		}
-		if len(staleIDs) > 0 {
-			if _, err := m.modelDAO.DeleteByIDs(ctx, tx, staleIDs); err != nil {
-				return err
-			}
-		}
 		return nil
 	})
 }
@@ -535,6 +676,28 @@ type CreateInstanceModelInfo struct {
 	Extra      map[string]interface{} `json:"extra"`
 }
 
+var (
+	errProviderModelNameRequired = errors.New("model name is required")
+	errDuplicateNormalizedModel  = errors.New("duplicate normalized model")
+	errDuplicateExistingModel    = errors.New("duplicate existing model")
+	errRemoteModelNotFound       = errors.New("remote model not found")
+)
+
+func providerInstanceModelErrorCode(err error) common.ErrorCode {
+	switch {
+	case errors.Is(err, errProviderModelNameRequired):
+		return common.CodeBadRequest
+	case errors.Is(err, errDuplicateNormalizedModel),
+		errors.Is(err, errDuplicateExistingModel),
+		errors.Is(err, dao.ErrTenantModelInstanceExists):
+		return common.CodeConflict
+	case errors.Is(err, errRemoteModelNotFound):
+		return common.CodeDataError
+	default:
+		return common.CodeServerError
+	}
+}
+
 func (m *ModelProviderService) getProviderByIDOrName(ctx context.Context, tenantID, providerIDOrName string) (*entity.TenantModelProvider, error) {
 	provider, err := m.modelProviderDAO.GetByID(ctx, dao.DB, providerIDOrName)
 	if err == nil && provider.TenantID == tenantID {
@@ -543,115 +706,263 @@ func (m *ModelProviderService) getProviderByIDOrName(ctx context.Context, tenant
 	return m.modelProviderDAO.GetByTenantIDAndProviderName(ctx, dao.DB, tenantID, strings.TrimSpace(providerIDOrName))
 }
 
+func copyCreateInstanceModelInfo(model CreateInstanceModelInfo) CreateInstanceModelInfo {
+	copied := model
+	if model.Extra != nil {
+		copied.Extra = make(map[string]interface{}, len(model.Extra))
+		for key, value := range model.Extra {
+			copied.Extra[key] = value
+		}
+	}
+	return copied
+}
+
+func (m *ModelProviderService) normalizeCreateInstanceModels(
+	ctx context.Context,
+	provider *entity.TenantModelProvider,
+	instance *entity.TenantModelInstance,
+	models []CreateInstanceModelInfo,
+) ([]CreateInstanceModelInfo, error) {
+	needsCatalog := false
+	for _, model := range models {
+		if strings.HasSuffix(strings.TrimSpace(model.ModelName), "@openai") {
+			needsCatalog = true
+			break
+		}
+	}
+
+	var listedNames []string
+	var err error
+	if needsCatalog {
+		listedNames, err = m.listRemoteModelNames(ctx, provider, instance)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	normalized := make([]CreateInstanceModelInfo, 0, len(models))
+	seen := make(map[string]struct{}, len(models))
+	for _, input := range models {
+		model := copyCreateInstanceModelInfo(input)
+		model.ModelName = strings.TrimSpace(model.ModelName)
+		if strings.HasSuffix(model.ModelName, "@openai") {
+			model.ModelName, _, err = normalizeModelNameAgainstListedCatalog(
+				model.ModelName,
+				listedNames,
+			)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if model.ModelName == "" {
+			return nil, errProviderModelNameRequired
+		}
+		if _, exists := seen[model.ModelName]; exists {
+			return nil, fmt.Errorf(
+				"%w %q",
+				errDuplicateNormalizedModel,
+				model.ModelName,
+			)
+		}
+		seen[model.ModelName] = struct{}{}
+		normalized = append(normalized, model)
+	}
+	return normalized, nil
+}
+
+func (m *ModelProviderService) createModelForInstance(
+	ctx context.Context,
+	db *gorm.DB,
+	provider *entity.TenantModelProvider,
+	instance *entity.TenantModelInstance,
+	model CreateInstanceModelInfo,
+) error {
+	_, err := m.modelDAO.GetModelByProviderIDAndInstanceIDAndModelName(
+		ctx,
+		db,
+		provider.ID,
+		instance.ID,
+		model.ModelName,
+	)
+	if err == nil {
+		return fmt.Errorf(
+			"model %q already exists for provider %q and instance %q",
+			model.ModelName,
+			provider.ProviderName,
+			instance.InstanceName,
+		)
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+
+	combinedType := entity.ModelType(0)
+	for _, modelType := range model.ModelTypes {
+		combinedType |= entity.ModelTypeFromString(modelType)
+	}
+	extraFields := map[string]interface{}{
+		"max_tokens": model.MaxTokens,
+	}
+	for key, value := range model.Extra {
+		extraFields[key] = value
+	}
+	extraBytes, err := json.Marshal(extraFields)
+	if err != nil {
+		return fmt.Errorf("fail to marshal extra: %w", err)
+	}
+
+	return m.modelDAO.Create(ctx, db, &entity.TenantModel{
+		ID:         utility.GenerateToken(),
+		ModelName:  model.ModelName,
+		ModelType:  int(combinedType),
+		ProviderID: provider.ID,
+		InstanceID: instance.ID,
+		Status:     "active",
+		Extra:      string(extraBytes),
+	})
+}
+
 func (m *ModelProviderService) CreateProviderInstance(ctx context.Context, providerIDOrName, instanceName, apiKey, baseURL, region, userID string, modelInfo []CreateInstanceModelInfo) (common.ErrorCode, error) {
 	providerIDOrName = strings.TrimSpace(providerIDOrName)
 
-	// Get tenant ID from user
 	tenants, err := m.userTenantDAO.GetByUserIDAndRole(ctx, dao.DB, userID, "owner")
 	if err != nil {
 		return common.CodeServerError, err
 	}
-
 	if len(tenants) == 0 {
 		return common.CodeNotFound, errors.New("user has no tenants")
 	}
-
 	tenantID := tenants[0].TenantID
 
 	provider, err := m.getProviderByIDOrName(ctx, tenantID, providerIDOrName)
 	if err != nil {
-		return common.CodeNotFound, fmt.Errorf("provider '%s' does not exist", providerIDOrName)
+		return common.CodeNotFound, fmt.Errorf("provider %q does not exist", providerIDOrName)
 	}
 	providerName := provider.ProviderName
-
-	// Normalize api_key: VLLM with empty api_key defaults to "x".
-	// Mirrors Python's _normalize_provider_api_key.
 	if strings.EqualFold(providerName, "VLLM") && apiKey == "" {
 		apiKey = "x"
 	}
 
-	// Verify the API key against the provider.
-	// Mirrors Python's verify_api_key (provider_api_service.py:596).
-	modelVerifyResult := m.verifyProviderAPIKey(ctx, providerName, apiKey, region, baseURL, modelInfo)
+	_, err = m.modelInstanceDAO.GetByProviderIDAndInstanceName(
+		ctx,
+		dao.DB,
+		provider.ID,
+		instanceName,
+	)
+	switch {
+	case err == nil:
+		return common.CodeConflict, fmt.Errorf(
+			"%w: instance %s",
+			dao.ErrTenantModelInstanceExists,
+			instanceName,
+		)
+	case !errors.Is(err, gorm.ErrRecordNotFound):
+		return common.CodeServerError, fmt.Errorf(
+			"fail to check model instance name: %w",
+			err,
+		)
+	}
 
-	instanceID := utility.GenerateToken()
-
-	extra := make(map[string]string)
-	extra["region"] = region
-	extra["base_url"] = baseURL
-	extraByte, err := json.Marshal(extra)
+	extraBytes, err := json.Marshal(map[string]string{
+		"region":   region,
+		"base_url": baseURL,
+	})
 	if err != nil {
 		return common.CodeServerError, errors.New("fail to marshal extra")
 	}
-	extraStr := string(extraByte)
-
-	tenantModelInstance := &entity.TenantModelInstance{
-		ID:           instanceID,
+	instance := &entity.TenantModelInstance{
+		ID:           utility.GenerateToken(),
 		InstanceName: instanceName,
 		ProviderID:   provider.ID,
 		APIKey:       apiKey,
 		Status:       "active",
-		Extra:        extraStr,
-	}
-	err = m.modelInstanceDAO.Create(ctx, dao.DB, tenantModelInstance)
-	if err != nil {
-		return common.CodeServerError, fmt.Errorf("fail to create model instance: %s", err.Error())
+		Extra:        string(extraBytes),
 	}
 
-	// Add models with verify result in extra.
+	modelsToCreate := make([]CreateInstanceModelInfo, 0, len(modelInfo))
 	if len(modelInfo) > 0 {
-		for _, model := range modelInfo {
-			if model.Extra == nil {
-				model.Extra = make(map[string]interface{})
-			}
-			verifyStatus := modelVerifyResult[model.ModelName]
-			if verifyStatus == "" {
-				verifyStatus = entity.ModelVerifyUnknown
-			}
-			model.Extra["verify"] = verifyStatus
-			if err = m.addModelToInstance(ctx, tenantID, providerName, instanceName, model); err != nil {
-				return common.CodeServerError, err
-			}
-		}
+		modelsToCreate = append(modelsToCreate, modelInfo...)
 	} else {
-		// model_info not provided — add all factory default models.
-		// Mirrors Python's create_provider_instance
-		// (api/apps/services/provider_api_service.py:506-531).
 		targetFactoryName := providerName
 		if region == "intl" && strings.EqualFold(providerName, "siliconflow") {
 			targetFactoryName = "siliconflow_intl"
 		}
-		factoryProvider := dao.GetModelProviderManager().FindProvider(targetFactoryName)
-		if factoryProvider != nil {
-			for _, llm := range factoryProvider.Models {
-				verifyStatus := modelVerifyResult[llm.Name]
-				if verifyStatus == "" {
-					verifyStatus = entity.ModelVerifyUnknown
+		if factoryProvider := dao.GetModelProviderManager().FindProvider(targetFactoryName); factoryProvider != nil {
+			for _, factoryModel := range factoryProvider.Models {
+				extra := map[string]interface{}{}
+				if factoryModel.Tools != nil {
+					extra["is_tools"] = factoryModel.Tools.Support
 				}
-				extraMap := map[string]interface{}{
-					"verify": verifyStatus,
+				if factoryModel.Thinking != nil {
+					extra["thinking"] = factoryModel.Thinking.DefaultValue
 				}
-				if llm.Tools != nil {
-					extraMap["is_tools"] = llm.Tools.Support
+				maxTokens := 8192
+				if factoryModel.MaxOutput != nil {
+					maxTokens = *factoryModel.MaxOutput
 				}
-				if llm.Thinking != nil {
-					extraMap["thinking"] = llm.Thinking.DefaultValue
-				}
-				if err = m.addModelToInstance(ctx, tenantID, providerName, instanceName, CreateInstanceModelInfo{
-					ModelName:  llm.Name,
-					ModelTypes: llm.ModelTypes,
-					MaxTokens: func() int {
-						if llm.MaxOutput != nil {
-							return *llm.MaxOutput
-						}
-						return 8192
-					}(),
-					Extra: extraMap,
-				}); err != nil {
-					return common.CodeServerError, err
-				}
+				modelsToCreate = append(modelsToCreate, CreateInstanceModelInfo{
+					ModelName:  factoryModel.Name,
+					ModelTypes: factoryModel.ModelTypes,
+					MaxTokens:  maxTokens,
+					Extra:      extra,
+				})
 			}
 		}
+	}
+
+	normalizedModels, err := m.normalizeCreateInstanceModels(
+		ctx,
+		provider,
+		instance,
+		modelsToCreate,
+	)
+	if err != nil {
+		return providerInstanceModelErrorCode(err), err
+	}
+
+	modelVerifyResult, err := m.verifyProviderAPIKey(
+		ctx,
+		providerName,
+		apiKey,
+		region,
+		baseURL,
+		modelInfo,
+	)
+	if err != nil {
+		return common.CodeServerError, fmt.Errorf("verify provider credentials: %w", err)
+	}
+	for index := range normalizedModels {
+		model := &normalizedModels[index]
+		if model.Extra == nil {
+			model.Extra = make(map[string]interface{})
+		}
+		verifyStatus := modelVerifyResult[modelsToCreate[index].ModelName]
+		if verifyStatus == "" {
+			verifyStatus = entity.ModelVerifyUnknown
+		}
+		model.Extra["verify"] = verifyStatus
+	}
+
+	if err = dao.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := m.modelProviderDAO.GetByIDAndTenantIDForUpdate(
+			ctx,
+			tx,
+			provider.ID,
+			tenantID,
+		); err != nil {
+			return fmt.Errorf("fail to lock model provider: %w", err)
+		}
+		if err := m.modelInstanceDAO.Create(ctx, tx, instance); err != nil {
+			return fmt.Errorf("fail to create model instance: %w", err)
+		}
+		for _, model := range normalizedModels {
+			if err := m.createModelForInstance(ctx, tx, provider, instance, model); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return providerInstanceModelErrorCode(err), err
 	}
 
 	return common.CodeSuccess, nil
@@ -690,18 +1001,29 @@ func (m *ModelProviderService) CreateNameOnlyProviderInstance(ctx context.Contex
 		Status:       "active",
 		Extra:        "{}",
 	}
-	err = m.modelInstanceDAO.Create(ctx, dao.DB, tenantModelInstance)
+	err = dao.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := m.modelProviderDAO.GetByIDAndTenantIDForUpdate(
+			ctx,
+			tx,
+			provider.ID,
+			tenantID,
+		); err != nil {
+			return fmt.Errorf("fail to lock model provider: %w", err)
+		}
+		return m.modelInstanceDAO.Create(ctx, tx, tenantModelInstance)
+	})
 	if err != nil {
-		return common.CodeServerError, fmt.Errorf("fail to create model instance: %s", err.Error())
+		err = fmt.Errorf("fail to create model instance: %w", err)
+		return providerInstanceModelErrorCode(err), err
 	}
 
 	return common.CodeSuccess, nil
 }
 
 // verifyProviderAPIKey verifies the API key against the provider by calling
-// the driver's CheckConnection. It returns a map from model name to verify
-// status (success/fail/unknown).
-func (m *ModelProviderService) verifyProviderAPIKey(ctx context.Context, providerName, apiKey, region, baseURL string, modelInfo []CreateInstanceModelInfo) map[string]string {
+// the driver's CheckConnection. It returns per-model status and propagates
+// connection failures so callers cannot persist unverified configuration.
+func (m *ModelProviderService) verifyProviderAPIKey(ctx context.Context, providerName, apiKey, region, baseURL string, modelInfo []CreateInstanceModelInfo) (map[string]string, error) {
 	result := make(map[string]string)
 
 	providerInfo := dao.GetModelProviderManager().FindProvider(providerName)
@@ -710,7 +1032,7 @@ func (m *ModelProviderService) verifyProviderAPIKey(ctx context.Context, provide
 		for _, model := range modelInfo {
 			result[model.ModelName] = entity.ModelVerifyUnknown
 		}
-		return result
+		return result, nil
 	}
 
 	apiKey = strings.TrimSpace(apiKey)
@@ -728,7 +1050,7 @@ func (m *ModelProviderService) verifyProviderAPIKey(ctx context.Context, provide
 			for _, model := range modelInfo {
 				result[model.ModelName] = entity.ModelVerifyFail
 			}
-			return result
+			return result, err
 		}
 	}
 
@@ -747,7 +1069,7 @@ func (m *ModelProviderService) verifyProviderAPIKey(ctx context.Context, provide
 	for _, model := range modelInfo {
 		result[model.ModelName] = verifyStatus
 	}
-	return result
+	return result, verifyErr
 }
 
 // addModelToInstance creates a single model under the given provider instance.
@@ -760,6 +1082,18 @@ func (m *ModelProviderService) addModelToInstance(ctx context.Context, tenantID,
 	instance, err := m.modelInstanceDAO.GetByProviderIDAndInstanceName(ctx, dao.DB, provider.ID, instanceName)
 	if err != nil {
 		return fmt.Errorf("no instance found for provider '%s' and instance '%s'", providerName, instanceName)
+	}
+	normalizedName, changed, err := m.normalizeModelNameAgainstRemoteCatalog(
+		ctx,
+		provider,
+		instance,
+		model.ModelName,
+	)
+	if err != nil {
+		return err
+	}
+	if changed {
+		model.ModelName = normalizedName
 	}
 
 	// Check for duplicate model.
@@ -1992,157 +2326,313 @@ func (m *ModelProviderService) AlterProviderInstance(ctx context.Context, userID
 
 	provider, err := m.getProviderByIDOrName(ctx, tenantID, providerIDOrName)
 	if err != nil {
-		return common.CodeNotFound, fmt.Errorf("provider '%s' does not exist", providerIDOrName)
+		return common.CodeNotFound, fmt.Errorf("provider %q does not exist", providerIDOrName)
 	}
 	providerName := provider.ProviderName
 
-	// Find the instance — try by ID first, then by name.
 	instance, err := m.modelInstanceDAO.GetByID(ctx, dao.DB, instanceIDOrName)
 	if err != nil || instance.ProviderID != provider.ID {
-		instance, err = m.modelInstanceDAO.GetByProviderIDAndInstanceName(ctx, dao.DB, provider.ID, instanceIDOrName)
+		instance, err = m.modelInstanceDAO.GetByProviderIDAndInstanceName(
+			ctx,
+			dao.DB,
+			provider.ID,
+			instanceIDOrName,
+		)
 	}
 	if err != nil {
-		return common.CodeNotFound, fmt.Errorf("no instance found for provider '%s' and instance '%s'", providerName, instanceIDOrName)
+		return common.CodeNotFound, fmt.Errorf(
+			"no instance found for provider %q and instance %q",
+			providerName,
+			instanceIDOrName,
+		)
 	}
 
-	// Normalize api_key: VLLM with empty api_key defaults to "x".
 	if strings.EqualFold(providerName, "vllm") && apiKey == "" {
 		apiKey = "x"
 	}
 
-	// Verify API key if requested.
-	modelVerifyResult := make(map[string]string)
-	if verify {
-		modelVerifyResult = m.verifyProviderAPIKey(ctx, providerName, apiKey, region, baseURL, modelInfo)
-	}
-
-	// Update instance record.
-	instanceUpdates := map[string]interface{}{
-		"api_key": apiKey,
-	}
-	if newInstanceName != "" && newInstanceName != instance.InstanceName {
-		instanceUpdates["instance_name"] = newInstanceName
-	}
-
-	extraFields := make(map[string]interface{})
-	if baseURL != "" {
-		extraFields["base_url"] = baseURL
-	}
-	if region != "" {
-		extraFields["region"] = region
-	}
-	// Preserve existing extra fields not overwritten.
-	existingExtra := make(map[string]interface{})
+	existingInstanceExtra := make(map[string]interface{})
 	if instance.Extra != "" {
-		if err = json.Unmarshal([]byte(instance.Extra), &existingExtra); err != nil {
+		if err = json.Unmarshal([]byte(instance.Extra), &existingInstanceExtra); err != nil {
 			return common.CodeServerError, err
 		}
 	}
-	for k, v := range extraFields {
-		existingExtra[k] = v
+	effectiveBaseURL := baseURL
+	if effectiveBaseURL == "" {
+		effectiveBaseURL, _ = existingInstanceExtra["base_url"].(string)
+	} else {
+		existingInstanceExtra["base_url"] = effectiveBaseURL
 	}
-	extraBytes, err := json.Marshal(existingExtra)
+	effectiveRegion := region
+	if effectiveRegion == "" {
+		effectiveRegion, _ = existingInstanceExtra["region"].(string)
+	} else {
+		existingInstanceExtra["region"] = effectiveRegion
+	}
+
+	modelVerifyResult := make(map[string]string)
+	if verify {
+		modelVerifyResult, err = m.verifyProviderAPIKey(
+			ctx,
+			providerName,
+			apiKey,
+			effectiveRegion,
+			effectiveBaseURL,
+			modelInfo,
+		)
+		if err != nil {
+			return common.CodeServerError, fmt.Errorf("verify provider credentials: %w", err)
+		}
+	}
+
+	instanceUpdates := map[string]interface{}{"api_key": apiKey}
+	effectiveInstanceName := instance.InstanceName
+	if newInstanceName != "" {
+		effectiveInstanceName = newInstanceName
+		if newInstanceName != instance.InstanceName {
+			instanceUpdates["instance_name"] = newInstanceName
+		}
+	}
+	extraBytes, err := json.Marshal(existingInstanceExtra)
 	if err != nil {
 		return common.CodeServerError, err
 	}
 	instanceUpdates["extra"] = string(extraBytes)
-	if err = m.modelInstanceDAO.UpdateByID(ctx, dao.DB, instance.ID, instanceUpdates); err != nil {
-		return common.CodeServerError, fmt.Errorf("fail to update instance: %s", err.Error())
-	}
 
-	// Use the (possibly updated) instance_name for model operations.
-	effectiveInstanceName := instance.InstanceName
-	if newInstanceName != "" {
-		effectiveInstanceName = newInstanceName
-	}
+	prospectiveInstance := *instance
+	prospectiveInstance.InstanceName = effectiveInstanceName
+	prospectiveInstance.APIKey = apiKey
+	prospectiveInstance.Extra = string(extraBytes)
 
-	// Upsert models: add new ones, update existing ones, remove ones no longer selected.
-	existingModels, err := m.modelDAO.GetModelsByInstanceID(ctx, dao.DB, instance.ID)
+	normalizedModels, err := m.normalizeCreateInstanceModels(
+		ctx,
+		provider,
+		&prospectiveInstance,
+		modelInfo,
+	)
 	if err != nil {
-		return common.CodeServerError, err
+		return providerInstanceModelErrorCode(err), err
 	}
-	existingModelMap := make(map[string]*entity.TenantModel)
-	for _, mdl := range existingModels {
-		existingModelMap[mdl.ModelName] = mdl
+	if verify {
+		for index := range normalizedModels {
+			model := &normalizedModels[index]
+			if model.Extra == nil {
+				model.Extra = make(map[string]interface{})
+			}
+			verifyStatus := modelVerifyResult[modelInfo[index].ModelName]
+			if verifyStatus == "" {
+				verifyStatus = entity.ModelVerifyUnknown
+			}
+			model.Extra["verify"] = verifyStatus
+		}
 	}
 
-	// Delete models that are no longer in the submitted model_info.
-	submittedModelNames := make(map[string]bool)
-	if modelInfo != nil {
-		for _, mdl := range modelInfo {
-			if mdl.ModelName != "" {
-				submittedModelNames[mdl.ModelName] = true
+	if err = dao.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := m.modelProviderDAO.GetByIDAndTenantIDForUpdate(
+			ctx,
+			tx,
+			provider.ID,
+			tenantID,
+		); err != nil {
+			return fmt.Errorf("fail to lock model provider: %w", err)
+		}
+
+		lockedInstance, err := m.modelInstanceDAO.GetByIDAndProviderIDForUpdate(
+			ctx,
+			tx,
+			instance.ID,
+			provider.ID,
+		)
+		if err != nil {
+			return fmt.Errorf("fail to lock model instance: %w", err)
+		}
+		if lockedInstance.InstanceName != instance.InstanceName ||
+			lockedInstance.APIKey != instance.APIKey ||
+			lockedInstance.Status != instance.Status ||
+			lockedInstance.Extra != instance.Extra {
+			return errors.New("model instance changed during validation")
+		}
+		if lockedInstance.InstanceName != effectiveInstanceName {
+			_, lookupErr := m.modelInstanceDAO.GetByProviderIDAndInstanceName(
+				ctx,
+				tx,
+				provider.ID,
+				effectiveInstanceName,
+			)
+			switch {
+			case lookupErr == nil:
+				return fmt.Errorf(
+					"%w: instance %s",
+					dao.ErrTenantModelInstanceExists,
+					effectiveInstanceName,
+				)
+			case !errors.Is(lookupErr, gorm.ErrRecordNotFound):
+				return fmt.Errorf(
+					"fail to check model instance name: %w",
+					lookupErr,
+				)
 			}
 		}
-	}
-	var idsToRemove []string
-	for name, mdl := range existingModelMap {
-		if !submittedModelNames[name] {
-			idsToRemove = append(idsToRemove, mdl.ID)
-		}
-	}
-	if len(idsToRemove) > 0 {
-		if _, err = m.modelDAO.DeleteByIDs(ctx, dao.DB, idsToRemove); err != nil {
-			return common.CodeServerError, err
-		}
-	}
 
-	// Add or update models from model_info.
-	if modelInfo != nil {
-		for _, mdl := range modelInfo {
-			if mdl.ModelName == "" {
+		existingModels, err := m.modelDAO.
+			GetModelsByProviderIDAndInstanceIDForUpdate(
+				ctx,
+				tx,
+				provider.ID,
+				lockedInstance.ID,
+			)
+		if err != nil {
+			return err
+		}
+		existingModelMap := make(
+			map[string]*entity.TenantModel,
+			len(existingModels),
+		)
+		for _, existingModel := range existingModels {
+			if _, exists := existingModelMap[existingModel.ModelName]; exists {
+				return fmt.Errorf(
+					"%w %q",
+					errDuplicateExistingModel,
+					existingModel.ModelName,
+				)
+			}
+			existingModelMap[existingModel.ModelName] = existingModel
+		}
+
+		submittedModelNames := make(map[string]struct{}, len(normalizedModels))
+		for _, model := range normalizedModels {
+			submittedModelNames[model.ModelName] = struct{}{}
+		}
+		idsToRemove := make([]string, 0)
+		for name, existingModel := range existingModelMap {
+			if _, retained := submittedModelNames[name]; !retained {
+				idsToRemove = append(idsToRemove, existingModel.ID)
+			}
+		}
+
+		lockedInstanceUpdates := make(map[string]interface{}, len(instanceUpdates))
+		if lockedInstance.APIKey != apiKey {
+			lockedInstanceUpdates["api_key"] = apiKey
+		}
+		if lockedInstance.InstanceName != effectiveInstanceName {
+			lockedInstanceUpdates["instance_name"] = effectiveInstanceName
+		}
+		if lockedInstance.Extra != string(extraBytes) {
+			lockedInstanceUpdates["extra"] = string(extraBytes)
+		}
+		if len(lockedInstanceUpdates) > 0 {
+			rows, err := m.modelInstanceDAO.UpdateByIDAndProviderID(
+				ctx,
+				tx,
+				lockedInstance.ID,
+				provider.ID,
+				lockedInstanceUpdates,
+			)
+			if err != nil {
+				return fmt.Errorf("fail to update instance: %w", err)
+			}
+			if rows != 1 {
+				return fmt.Errorf("model instance update updated %d rows, want 1", rows)
+			}
+		}
+
+		if len(idsToRemove) > 0 {
+			rows, err := m.modelDAO.DeleteByIDsAndScope(
+				ctx,
+				tx,
+				idsToRemove,
+				provider.ID,
+				lockedInstance.ID,
+			)
+			if err != nil {
+				return err
+			}
+			if rows != int64(len(idsToRemove)) {
+				return fmt.Errorf(
+					"model deletion deleted %d rows, want %d",
+					rows,
+					len(idsToRemove),
+				)
+			}
+		}
+
+		for _, model := range normalizedModels {
+			existingModel, exists := existingModelMap[model.ModelName]
+			if !exists {
+				if err := m.createModelForInstance(
+					ctx,
+					tx,
+					provider,
+					&prospectiveInstance,
+					model,
+				); err != nil {
+					return err
+				}
 				continue
 			}
-			// Attach verify status.
-			if verify {
-				verifyStatus := modelVerifyResult[mdl.ModelName]
-				if verifyStatus == "" {
-					verifyStatus = entity.ModelVerifyUnknown
+
+			updates := make(map[string]interface{})
+			if len(model.ModelTypes) > 0 {
+				combinedType := entity.ModelType(0)
+				for _, modelType := range model.ModelTypes {
+					combinedType |= entity.ModelTypeFromString(modelType)
 				}
-				if mdl.Extra == nil {
-					mdl.Extra = make(map[string]interface{})
+				if int(combinedType) != existingModel.ModelType {
+					updates["model_type"] = int(combinedType)
 				}
-				mdl.Extra["verify"] = verifyStatus
 			}
 
-			if existingMdl, exists := existingModelMap[mdl.ModelName]; exists {
-				// Update existing model.
-				updates := make(map[string]interface{})
-				if len(mdl.ModelTypes) > 0 {
-					combinedType := entity.ModelType(0)
-					for _, t := range mdl.ModelTypes {
-						combinedType |= entity.ModelTypeFromString(t)
-					}
-					if int(combinedType) != existingMdl.ModelType {
-						updates["model_type"] = int(combinedType)
-					}
-				}
-				mergedExtra := make(map[string]interface{})
-				if existingMdl.Extra != "" {
-					json.Unmarshal([]byte(existingMdl.Extra), &mergedExtra)
-				}
-				if mdl.Extra != nil {
-					for k, v := range mdl.Extra {
-						mergedExtra[k] = v
-					}
-				}
-				if mdl.MaxTokens > 0 {
-					mergedExtra["max_tokens"] = mdl.MaxTokens
-				}
-				extraBytes, _ = json.Marshal(mergedExtra)
-				updates["extra"] = string(extraBytes)
-				if len(updates) > 0 {
-					if err = m.modelDAO.UpdateByID(ctx, dao.DB, existingMdl.ID, updates); err != nil {
-						return common.CodeServerError, err
-					}
-				}
-			} else {
-				// Add new model.
-				if err = m.addModelToInstance(ctx, tenantID, providerName, effectiveInstanceName, mdl); err != nil {
-					return common.CodeServerError, err
+			mergedExtra := make(map[string]interface{})
+			if existingModel.Extra != "" {
+				if err := json.Unmarshal(
+					[]byte(existingModel.Extra),
+					&mergedExtra,
+				); err != nil {
+					return fmt.Errorf(
+						"invalid model metadata for %q: %w",
+						existingModel.ModelName,
+						err,
+					)
 				}
 			}
+			for key, value := range model.Extra {
+				mergedExtra[key] = value
+			}
+			if model.MaxTokens > 0 {
+				mergedExtra["max_tokens"] = model.MaxTokens
+			}
+			modelExtraBytes, err := json.Marshal(mergedExtra)
+			if err != nil {
+				return fmt.Errorf("fail to marshal model metadata: %w", err)
+			}
+			if string(modelExtraBytes) != existingModel.Extra {
+				updates["extra"] = string(modelExtraBytes)
+			}
+			if len(updates) == 0 {
+				continue
+			}
+			rows, err := m.modelDAO.UpdateByIDAndScope(
+				ctx,
+				tx,
+				existingModel.ID,
+				provider.ID,
+				lockedInstance.ID,
+				updates,
+			)
+			if err != nil {
+				return err
+			}
+			if rows != 1 {
+				return fmt.Errorf("model update updated %d rows, want 1", rows)
+			}
 		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, errDuplicateExistingModel) ||
+			errors.Is(err, dao.ErrTenantModelInstanceExists) {
+			return common.CodeConflict, err
+		}
+		return common.CodeServerError, err
 	}
 
 	return common.CodeSuccess, nil
@@ -2409,16 +2899,32 @@ func (m *ModelProviderService) AlterModel(ctx context.Context, providerName, ins
 	}
 
 	var model *entity.TenantModel
+	modelsWithSameName := make([]*entity.TenantModel, 0, 1)
 	if modelName != "" {
-		model, err = m.modelDAO.GetModelByProviderIDAndInstanceIDAndModelName(ctx, dao.DB, provider.ID, instance.ID, modelName)
+		modelsWithSameName, err = m.modelDAO.GetModelsByProviderIDAndInstanceIDAndModelName(ctx, dao.DB, provider.ID, instance.ID, modelName)
 		if err != nil {
-			if !errors.Is(err, gorm.ErrRecordNotFound) {
-				return common.CodeServerError, err
-			}
+			return common.CodeServerError, err
+		}
+		if len(modelsWithSameName) == 0 {
 			return common.CodeNotFound, fmt.Errorf("model %q not found for provider %q and instance %q", modelName, providerName, instanceName)
 		}
-		if modelID != "" && model.ID != modelID {
-			return common.CodeBadRequest, errors.New("model ID does not match model name")
+		if len(modelsWithSameName) > 1 && modelID == "" {
+			return common.CodeConflict, fmt.Errorf("model %q is ambiguous; model ID is required", modelName)
+		}
+		model = modelsWithSameName[0]
+		if modelID != "" {
+			matched := false
+			for _, candidate := range modelsWithSameName {
+				if candidate.ID == modelID {
+					model = candidate
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return common.CodeBadRequest, errors.New("model ID does not match model name")
+			}
+			modelsWithSameName = []*entity.TenantModel{model}
 		}
 	} else {
 		model, err = m.modelDAO.GetByID(ctx, dao.DB, modelID)
@@ -2431,15 +2937,14 @@ func (m *ModelProviderService) AlterModel(ctx context.Context, providerName, ins
 		if model.ProviderID != provider.ID || model.InstanceID != instance.ID {
 			return common.CodeNotFound, fmt.Errorf("model with ID %q does not belong to provider %q and instance %q", modelID, providerName, instanceName)
 		}
+		modelsWithSameName = []*entity.TenantModel{model}
 	}
 
 	toUpdate := make(map[string]interface{})
 
 	// Handle status (validation already done above, here we only apply the change)
-	if status, ok := updateDict["status"].(string); ok && status != "" {
-		if status != model.Status {
-			toUpdate["status"] = status
-		}
+	if status, ok := updateDict["status"].(string); ok && status != "" && status != model.Status {
+		toUpdate["status"] = status
 	}
 
 	// Handle model_type
@@ -2487,8 +2992,19 @@ func (m *ModelProviderService) AlterModel(ctx context.Context, providerName, ins
 	}
 
 	if len(toUpdate) > 0 {
-		if err = m.modelDAO.UpdateByID(ctx, dao.DB, model.ID, toUpdate); err != nil {
-			return common.CodeServerError, err
+		rows, updateErr := m.modelDAO.UpdateByIDAndScope(
+			ctx,
+			dao.DB,
+			model.ID,
+			provider.ID,
+			instance.ID,
+			toUpdate,
+		)
+		if updateErr != nil {
+			return common.CodeServerError, updateErr
+		}
+		if rows != 1 {
+			return common.CodeServerError, fmt.Errorf("tenant model update updated %d rows, want 1", rows)
 		}
 	}
 
@@ -2601,15 +3117,62 @@ func maxTokensFromTenantModelExtra(modelEntity *entity.TenantModel, fallback int
 	return fallback, nil
 }
 
+var (
+	errTenantModelLookup    = errors.New("tenant model lookup failed")
+	errTenantModelAmbiguous = errors.New("tenant model is ambiguous")
+	errTenantModelNotFound  = errors.New("tenant model not found")
+)
+
+func modelResolutionErrorCode(err error) common.ErrorCode {
+	switch {
+	case errors.Is(err, errTenantModelAmbiguous):
+		return common.CodeConflict
+	case errors.Is(err, errTenantModelNotFound):
+		return common.CodeNotFound
+	default:
+		return common.CodeServerError
+	}
+}
+
+func modelResolutionFailure(
+	info *ModelInstanceAndProviderInfo,
+	err error,
+) error {
+	if err != nil {
+		return err
+	}
+	if info == nil {
+		return errors.New("empty model resolution result")
+	}
+	return nil
+}
+
+func tenantModelInfo(modelEntity *entity.TenantModel) (*modelModule.Model, error) {
+	if modelEntity == nil {
+		return nil, nil
+	}
+
+	modelTypes := entity.ModelType(modelEntity.ModelType).HumanReadable()
+	modelInfo := &modelModule.Model{
+		Name:         modelEntity.ModelName,
+		ModelTypes:   modelTypes,
+		ModelTypeMap: make(map[string]bool, len(modelTypes)),
+	}
+	for _, modelType := range modelTypes {
+		modelInfo.ModelTypeMap[modelType] = true
+	}
+	return modelInfoWithTenantExtra(modelInfo, modelEntity)
+}
+
 func (m *ModelProviderService) getModelInstanceAndProviderByName(ctx context.Context, providerName, instanceName, modelName *string, userID string, apiConfig *modelModule.APIConfig) (*ModelInstanceAndProviderInfo, error) {
 	// Get tenant ID from user
 	tenants, err := m.userTenantDAO.GetByUserIDAndRole(ctx, dao.DB, userID, "owner")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w for user tenant: %w", errTenantModelLookup, err)
 	}
 
 	if len(tenants) == 0 {
-		return nil, err
+		return nil, fmt.Errorf("%w: user has no tenant", errTenantModelNotFound)
 	}
 
 	tenantID := tenants[0].TenantID
@@ -2617,18 +3180,35 @@ func (m *ModelProviderService) getModelInstanceAndProviderByName(ctx context.Con
 	// Check if provider exists
 	providerEntity, err := m.modelProviderDAO.GetByTenantIDAndProviderName(ctx, dao.DB, tenantID, *providerName)
 	if err != nil {
-		return nil, err
+		if dao.IsNotFoundErr(err) {
+			return nil, fmt.Errorf("%w: provider %q", errTenantModelNotFound, *providerName)
+		}
+		return nil, fmt.Errorf("%w for provider %q: %w", errTenantModelLookup, *providerName, err)
 	}
 
 	instanceEntity, err := m.modelInstanceDAO.GetByProviderIDAndInstanceName(ctx, dao.DB, providerEntity.ID, *instanceName)
 	if err != nil {
-		return nil, err
+		if dao.IsNotFoundErr(err) {
+			return nil, fmt.Errorf("%w: instance %q", errTenantModelNotFound, *instanceName)
+		}
+		return nil, fmt.Errorf("%w for instance %q: %w", errTenantModelLookup, *instanceName, err)
 	}
 
-	modelEntity, err := m.modelDAO.GetModelByProviderIDAndInstanceIDAndModelName(ctx, dao.DB, providerEntity.ID, instanceEntity.ID, *modelName)
+	modelEntities, err := m.modelDAO.GetModelsByProviderIDAndInstanceIDAndModelName(ctx, dao.DB, providerEntity.ID, instanceEntity.ID, *modelName)
 	if err != nil {
-		// Not found model
-		modelEntity = nil
+		return nil, fmt.Errorf(
+			"%w for %q: %w",
+			errTenantModelLookup,
+			*modelName,
+			err,
+		)
+	}
+	if len(modelEntities) > 1 {
+		return nil, fmt.Errorf("%w across model types: %q", errTenantModelAmbiguous, *modelName)
+	}
+	var modelEntity *entity.TenantModel
+	if len(modelEntities) == 1 {
+		modelEntity = modelEntities[0]
 	}
 
 	providerInfo := dao.GetModelProviderManager().FindProvider(*providerName)
@@ -2638,9 +3218,18 @@ func (m *ModelProviderService) getModelInstanceAndProviderByName(ctx context.Con
 
 	modelInfo, err := dao.GetModelProviderManager().GetModelByName(*providerName, *modelName)
 	if err != nil {
-		return nil, errors.New(fmt.Sprintf("provider %s model %s not found", *providerName, *modelName))
+		if modelEntity == nil {
+			return nil, fmt.Errorf(
+				"%w: provider %q model %q",
+				errTenantModelNotFound,
+				*providerName,
+				*modelName,
+			)
+		}
+		modelInfo, err = tenantModelInfo(modelEntity)
+	} else {
+		modelInfo, err = modelInfoWithTenantExtra(modelInfo, modelEntity)
 	}
-	modelInfo, err = modelInfoWithTenantExtra(modelInfo, modelEntity)
 	if err != nil {
 		return nil, err
 	}
@@ -2678,32 +3267,45 @@ func (m *ModelProviderService) getModelInstanceAndProviderByID(ctx context.Conte
 	// Get tenant ID from user
 	tenants, err := m.userTenantDAO.GetByUserIDAndRole(ctx, dao.DB, userID, "owner")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w for user tenant: %w", errTenantModelLookup, err)
 	}
 
 	if len(tenants) == 0 {
-		return nil, err
+		return nil, fmt.Errorf("%w: user has no tenant", errTenantModelNotFound)
 	}
 
 	tenantID := tenants[0].TenantID
 
 	modelEntity, err := m.modelDAO.GetByID(ctx, dao.DB, *modelID)
 	if err != nil {
-		return nil, err
+		if dao.IsNotFoundErr(err) {
+			return nil, fmt.Errorf("%w: model ID %q", errTenantModelNotFound, *modelID)
+		}
+		return nil, fmt.Errorf("%w for ID %q: %w", errTenantModelLookup, *modelID, err)
 	}
 
 	instanceEntity, err := m.modelInstanceDAO.GetByID(ctx, dao.DB, modelEntity.InstanceID)
 	if err != nil {
-		return nil, err
+		if dao.IsNotFoundErr(err) {
+			return nil, fmt.Errorf("%w: instance ID %q", errTenantModelNotFound, modelEntity.InstanceID)
+		}
+		return nil, fmt.Errorf("%w for instance ID %q: %w", errTenantModelLookup, modelEntity.InstanceID, err)
 	}
 
 	providerEntity, err := m.modelProviderDAO.GetByID(ctx, dao.DB, instanceEntity.ProviderID)
 	if err != nil {
-		return nil, err
+		if dao.IsNotFoundErr(err) {
+			return nil, fmt.Errorf("%w: provider ID %q", errTenantModelNotFound, instanceEntity.ProviderID)
+		}
+		return nil, fmt.Errorf("%w for provider ID %q: %w", errTenantModelLookup, instanceEntity.ProviderID, err)
 	}
 
 	if providerEntity.TenantID != tenantID {
-		return nil, errors.New("provider not found")
+		return nil, fmt.Errorf(
+			"%w: provider ID %q",
+			errTenantModelNotFound,
+			providerEntity.ID,
+		)
 	}
 
 	providerInfo := dao.GetModelProviderManager().FindProvider(providerEntity.ProviderName)
@@ -2713,9 +3315,10 @@ func (m *ModelProviderService) getModelInstanceAndProviderByID(ctx context.Conte
 
 	modelInfo, err := dao.GetModelProviderManager().GetModelByName(providerEntity.ProviderName, modelEntity.ModelName)
 	if err != nil {
-		return nil, errors.New(fmt.Sprintf("provider %s model %s not found", providerEntity.ProviderName, modelEntity.ModelName))
+		modelInfo, err = tenantModelInfo(modelEntity)
+	} else {
+		modelInfo, err = modelInfoWithTenantExtra(modelInfo, modelEntity)
 	}
-	modelInfo, err = modelInfoWithTenantExtra(modelInfo, modelEntity)
 	if err != nil {
 		return nil, err
 	}
@@ -2757,13 +3360,13 @@ func (m *ModelProviderService) ChatToModelWithMessages(ctx context.Context, prov
 
 	if modelID != nil {
 		info, err = m.getModelInstanceAndProviderByID(ctx, modelID, userID, apiConfig)
-		if err != nil || info == nil {
-			return nil, common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return nil, modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	} else {
 		info, err = m.getModelInstanceAndProviderByName(ctx, providerName, instanceName, modelName, userID, apiConfig)
-		if err != nil || info == nil {
-			return nil, common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return nil, modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	}
 
@@ -2806,8 +3409,10 @@ func (m *ModelProviderService) ChatToModelWithMessages(ctx context.Context, prov
 	}
 
 	modelUsage.TenantID = info.ProviderEntity.TenantID
+	modelUsage.ProviderName = resolvedProviderName
 	modelUsage.InstanceID = info.InstanceEntity.ID
 	modelUsage.APIKey = info.InstanceEntity.APIKey
+	modelUsage.ModelName = resolvedModelName
 
 	response, err = modelDriver.ChatWithMessages(ctx, resolvedModelName, messages, info.APIConfig, modelConfig, modelUsage)
 	if err != nil {
@@ -2828,13 +3433,13 @@ func (m *ModelProviderService) ChatToModelStreamWithSender(ctx context.Context, 
 
 	if modelID != nil {
 		info, err = m.getModelInstanceAndProviderByID(ctx, modelID, userID, apiConfig)
-		if err != nil || info == nil {
-			return common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	} else {
 		info, err = m.getModelInstanceAndProviderByName(ctx, providerName, instanceName, modelName, userID, apiConfig)
-		if err != nil || info == nil {
-			return common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	}
 
@@ -2873,8 +3478,10 @@ func (m *ModelProviderService) ChatToModelStreamWithSender(ctx context.Context, 
 	}
 
 	modelUsage.TenantID = info.ProviderEntity.TenantID
+	modelUsage.ProviderName = resolvedProviderName
 	modelUsage.InstanceID = info.InstanceEntity.ID
 	modelUsage.APIKey = info.InstanceEntity.APIKey
+	modelUsage.ModelName = resolvedModelName
 
 	err = modelDriver.ChatStreamlyWithSender(ctx, resolvedModelName, messages, info.APIConfig, modelConfig, modelUsage, sender)
 	if err != nil {
@@ -2896,15 +3503,7 @@ func validateEmbeddingModel(model *modelModule.Model, requestedDimension, reques
 		return fmt.Errorf("input batch size <= 0")
 	}
 
-	if model.MaxDimension == nil {
-		return fmt.Errorf("input embedding max dimension is nil, %s", model.Name)
-	}
-
-	if model.MaxBatchSize == nil {
-		return fmt.Errorf("input embedding max batch size is nil, %s", model.Name)
-	}
-
-	if *model.MaxBatchSize < requestedBatchSize {
+	if model.MaxBatchSize != nil && *model.MaxBatchSize < requestedBatchSize {
 		return fmt.Errorf("input embedding max batch size is more than limitation, %s", model.Name)
 	}
 
@@ -2941,13 +3540,13 @@ func (m *ModelProviderService) EmbedText(ctx context.Context, providerName, inst
 
 	if modelID != nil {
 		info, err = m.getModelInstanceAndProviderByID(ctx, modelID, userID, apiConfig)
-		if err != nil || info == nil {
-			return nil, common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return nil, modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	} else {
 		info, err = m.getModelInstanceAndProviderByName(ctx, providerName, instanceName, modelName, userID, apiConfig)
-		if err != nil || info == nil {
-			return nil, common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return nil, modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	}
 
@@ -3007,13 +3606,13 @@ func (m *ModelProviderService) RerankDocument(ctx context.Context, providerName,
 
 	if modelID != nil {
 		info, err = m.getModelInstanceAndProviderByID(ctx, modelID, userID, apiConfig)
-		if err != nil || info == nil {
-			return nil, common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return nil, modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	} else {
 		info, err = m.getModelInstanceAndProviderByName(ctx, providerName, instanceName, modelName, userID, apiConfig)
-		if err != nil || info == nil {
-			return nil, common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return nil, modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	}
 
@@ -3054,6 +3653,9 @@ func (m *ModelProviderService) RerankDocument(ctx context.Context, providerName,
 	if err != nil {
 		return nil, common.CodeServerError, err
 	}
+	if response == nil {
+		return nil, common.CodeServerError, errors.New("empty rerank response")
+	}
 
 	return response, common.CodeSuccess, nil
 }
@@ -3066,35 +3668,40 @@ func (m *ModelProviderService) TranscribeAudio(ctx context.Context, providerName
 
 	if modelID != nil {
 		info, err = m.getModelInstanceAndProviderByID(ctx, modelID, userID, apiConfig)
-		if err != nil || info == nil {
-			return nil, common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return nil, modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	} else {
 		info, err = m.getModelInstanceAndProviderByName(ctx, providerName, instanceName, modelName, userID, apiConfig)
-		if err != nil || info == nil {
-			return nil, common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return nil, modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	}
 
 	if modelConfig == nil {
 		modelConfig = &modelModule.ASRConfig{}
 	}
+	resolvedModelName := info.ModelInfo.Name
+	if info.ModelEntity != nil && info.ModelEntity.ModelName != "" {
+		resolvedModelName = info.ModelEntity.ModelName
+	}
+	resolvedProviderName := info.ProviderEntity.ProviderName
 
 	var modelDriver modelModule.ModelDriver
 
 	if info.ModelEntity == nil {
 		if !info.ModelInfo.ModelTypeMap["asr"] {
-			return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is an ASR model", *modelName, *providerName))
+			return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is an ASR model", resolvedModelName, resolvedProviderName))
 		}
 		modelDriver = info.ProviderInfo.ModelDriver
 	} else {
 		// model entity exists
 		if info.ModelEntity.Status == "active" {
 			if !entity.ModelType(info.ModelEntity.ModelType).Has(entity.ModelTypeSpeech2Text) {
-				return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is an ASR model", *modelName, *providerName))
+				return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is an ASR model", resolvedModelName, resolvedProviderName))
 			}
 
-			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, *providerName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
+			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, resolvedProviderName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
 			if err != nil {
 				return nil, common.CodeServerError, err
 			}
@@ -3104,7 +3711,7 @@ func (m *ModelProviderService) TranscribeAudio(ctx context.Context, providerName
 	}
 
 	var response *modelModule.ASRResponse
-	response, err = modelDriver.TranscribeAudio(ctx, modelName, audioFile, apiConfig, modelConfig, nil)
+	response, err = modelDriver.TranscribeAudio(ctx, &resolvedModelName, audioFile, info.APIConfig, modelConfig, nil)
 	if err != nil {
 		return nil, common.CodeServerError, err
 	}
@@ -3123,35 +3730,40 @@ func (m *ModelProviderService) TranscribeAudioStream(ctx context.Context, provid
 
 	if modelID != nil {
 		info, err = m.getModelInstanceAndProviderByID(ctx, modelID, userID, apiConfig)
-		if err != nil || info == nil {
-			return common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	} else {
 		info, err = m.getModelInstanceAndProviderByName(ctx, providerName, instanceName, modelName, userID, apiConfig)
-		if err != nil || info == nil {
-			return common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	}
 
 	if modelConfig == nil {
 		modelConfig = &modelModule.ASRConfig{}
 	}
+	resolvedModelName := info.ModelInfo.Name
+	if info.ModelEntity != nil && info.ModelEntity.ModelName != "" {
+		resolvedModelName = info.ModelEntity.ModelName
+	}
+	resolvedProviderName := info.ProviderEntity.ProviderName
 
 	var modelDriver modelModule.ModelDriver
 
 	if info.ModelEntity == nil {
 		if !info.ModelInfo.ModelTypeMap["asr"] {
-			return common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is an ASR model", *modelName, *providerName))
+			return common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is an ASR model", resolvedModelName, resolvedProviderName))
 		}
 		modelDriver = info.ProviderInfo.ModelDriver
 	} else {
 		// model entity exists
 		if info.ModelEntity.Status == "active" {
 			if !entity.ModelType(info.ModelEntity.ModelType).Has(entity.ModelTypeSpeech2Text) {
-				return common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is an ASR model", *modelName, *providerName))
+				return common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is an ASR model", resolvedModelName, resolvedProviderName))
 			}
 
-			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, *providerName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
+			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, resolvedProviderName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
 			if err != nil {
 				return common.CodeServerError, err
 			}
@@ -3160,7 +3772,7 @@ func (m *ModelProviderService) TranscribeAudioStream(ctx context.Context, provid
 		}
 	}
 
-	err = modelDriver.TranscribeAudioWithSender(ctx, modelName, audioFile, apiConfig, modelConfig, nil, sender)
+	err = modelDriver.TranscribeAudioWithSender(ctx, &resolvedModelName, audioFile, info.APIConfig, modelConfig, nil, sender)
 	if err != nil {
 		return common.CodeServerError, err
 	}
@@ -3176,35 +3788,40 @@ func (m *ModelProviderService) AudioSpeech(ctx context.Context, providerName, in
 
 	if modelID != nil {
 		info, err = m.getModelInstanceAndProviderByID(ctx, modelID, userID, apiConfig)
-		if err != nil || info == nil {
-			return nil, common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return nil, modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	} else {
 		info, err = m.getModelInstanceAndProviderByName(ctx, providerName, instanceName, modelName, userID, apiConfig)
-		if err != nil || info == nil {
-			return nil, common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return nil, modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	}
 
 	if modelConfig == nil {
 		modelConfig = &modelModule.TTSConfig{}
 	}
+	resolvedModelName := info.ModelInfo.Name
+	if info.ModelEntity != nil && info.ModelEntity.ModelName != "" {
+		resolvedModelName = info.ModelEntity.ModelName
+	}
+	resolvedProviderName := info.ProviderEntity.ProviderName
 
 	var modelDriver modelModule.ModelDriver
 
 	if info.ModelEntity == nil {
 		if !info.ModelInfo.ModelTypeMap["tts"] {
-			return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a TTS model", *modelName, *providerName))
+			return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a TTS model", resolvedModelName, resolvedProviderName))
 		}
 		modelDriver = info.ProviderInfo.ModelDriver
 	} else {
 		// model entity exists
 		if info.ModelEntity.Status == "active" {
 			if !entity.ModelType(info.ModelEntity.ModelType).Has(entity.ModelTypeTTS) {
-				return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a TTS model", *modelName, *providerName))
+				return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a TTS model", resolvedModelName, resolvedProviderName))
 			}
 
-			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, *providerName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
+			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, resolvedProviderName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
 			if err != nil {
 				return nil, common.CodeServerError, err
 			}
@@ -3214,7 +3831,7 @@ func (m *ModelProviderService) AudioSpeech(ctx context.Context, providerName, in
 	}
 
 	var response *modelModule.TTSResponse
-	response, err = modelDriver.AudioSpeech(ctx, modelName, audioContent, apiConfig, modelConfig, nil)
+	response, err = modelDriver.AudioSpeech(ctx, &resolvedModelName, audioContent, info.APIConfig, modelConfig, nil)
 	if err != nil {
 		return nil, common.CodeServerError, err
 	}
@@ -3232,35 +3849,40 @@ func (m *ModelProviderService) AudioSpeechStream(ctx context.Context, providerNa
 
 	if modelID != nil {
 		info, err = m.getModelInstanceAndProviderByID(ctx, modelID, userID, apiConfig)
-		if err != nil || info == nil {
-			return common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	} else {
 		info, err = m.getModelInstanceAndProviderByName(ctx, providerName, instanceName, modelName, userID, apiConfig)
-		if err != nil || info == nil {
-			return common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	}
 
 	if modelConfig == nil {
 		modelConfig = &modelModule.TTSConfig{}
 	}
+	resolvedModelName := info.ModelInfo.Name
+	if info.ModelEntity != nil && info.ModelEntity.ModelName != "" {
+		resolvedModelName = info.ModelEntity.ModelName
+	}
+	resolvedProviderName := info.ProviderEntity.ProviderName
 
 	var modelDriver modelModule.ModelDriver
 
 	if info.ModelEntity == nil {
 		if !info.ModelInfo.ModelTypeMap["tts"] {
-			return common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a TTS model", *modelName, *providerName))
+			return common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a TTS model", resolvedModelName, resolvedProviderName))
 		}
 		modelDriver = info.ProviderInfo.ModelDriver
 	} else {
 		// model entity exists
 		if info.ModelEntity.Status == "active" {
 			if !entity.ModelType(info.ModelEntity.ModelType).Has(entity.ModelTypeTTS) {
-				return common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a TTS model", *modelName, *providerName))
+				return common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a TTS model", resolvedModelName, resolvedProviderName))
 			}
 
-			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, *providerName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
+			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, resolvedProviderName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
 			if err != nil {
 				return common.CodeServerError, err
 			}
@@ -3269,7 +3891,7 @@ func (m *ModelProviderService) AudioSpeechStream(ctx context.Context, providerNa
 		}
 	}
 
-	err = modelDriver.AudioSpeechWithSender(ctx, modelName, audioContent, apiConfig, modelConfig, nil, sender)
+	err = modelDriver.AudioSpeechWithSender(ctx, &resolvedModelName, audioContent, info.APIConfig, modelConfig, nil, sender)
 	if err != nil {
 		return common.CodeServerError, err
 	}
@@ -3284,35 +3906,40 @@ func (m *ModelProviderService) OCRFile(ctx context.Context, providerName, instan
 
 	if modelID != nil {
 		info, err = m.getModelInstanceAndProviderByID(ctx, modelID, userID, apiConfig)
-		if err != nil || info == nil {
-			return nil, common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return nil, modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	} else {
 		info, err = m.getModelInstanceAndProviderByName(ctx, providerName, instanceName, modelName, userID, apiConfig)
-		if err != nil || info == nil {
-			return nil, common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return nil, modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	}
 
 	if modelConfig == nil {
 		modelConfig = &modelModule.OCRConfig{}
 	}
+	resolvedModelName := info.ModelInfo.Name
+	if info.ModelEntity != nil && info.ModelEntity.ModelName != "" {
+		resolvedModelName = info.ModelEntity.ModelName
+	}
+	resolvedProviderName := info.ProviderEntity.ProviderName
 
 	var modelDriver modelModule.ModelDriver
 
 	if info.ModelEntity == nil {
 		if !info.ModelInfo.ModelTypeMap["ocr"] {
-			return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is an OCR model", *modelName, *providerName))
+			return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is an OCR model", resolvedModelName, resolvedProviderName))
 		}
 		modelDriver = info.ProviderInfo.ModelDriver
 	} else {
 		// model entity exists
 		if info.ModelEntity.Status == "active" {
 			if !entity.ModelType(info.ModelEntity.ModelType).Has(entity.ModelTypeOCR) {
-				return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is an OCR model", *modelName, *providerName))
+				return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is an OCR model", resolvedModelName, resolvedProviderName))
 			}
 
-			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, *providerName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
+			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, resolvedProviderName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
 			if err != nil {
 				return nil, common.CodeServerError, err
 			}
@@ -3322,7 +3949,7 @@ func (m *ModelProviderService) OCRFile(ctx context.Context, providerName, instan
 	}
 
 	var response *modelModule.OCRFileResponse
-	response, err = modelDriver.OCRFile(ctx, modelName, content, url, apiConfig, modelConfig, nil)
+	response, err = modelDriver.OCRFile(ctx, &resolvedModelName, content, url, info.APIConfig, modelConfig, nil)
 	if err != nil {
 		return nil, common.CodeServerError, err
 	}
@@ -3340,25 +3967,30 @@ func (m *ModelProviderService) ParseFile(ctx context.Context, providerName, inst
 
 	if modelID != nil {
 		info, err = m.getModelInstanceAndProviderByID(ctx, modelID, userID, apiConfig)
-		if err != nil || info == nil {
-			return nil, common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return nil, modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	} else {
 		info, err = m.getModelInstanceAndProviderByName(ctx, providerName, instanceName, modelName, userID, apiConfig)
-		if err != nil || info == nil {
-			return nil, common.CodeNotFound, err
+		if resolutionErr := modelResolutionFailure(info, err); resolutionErr != nil {
+			return nil, modelResolutionErrorCode(resolutionErr), resolutionErr
 		}
 	}
 
 	if modelConfig == nil {
 		modelConfig = &modelModule.ParseFileConfig{}
 	}
+	resolvedModelName := info.ModelInfo.Name
+	if info.ModelEntity != nil && info.ModelEntity.ModelName != "" {
+		resolvedModelName = info.ModelEntity.ModelName
+	}
+	resolvedProviderName := info.ProviderEntity.ProviderName
 
 	var modelDriver modelModule.ModelDriver
 
 	if info.ModelEntity == nil {
 		if !info.ModelInfo.ModelTypeMap["doc_parse"] {
-			return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a ParseFile model", *modelName, *providerName))
+			return nil, common.CodeNotFound, errors.New(fmt.Sprintf("expect model %s@%s is a ParseFile model", resolvedModelName, resolvedProviderName))
 		}
 		modelDriver = info.ProviderInfo.ModelDriver
 	} else {
@@ -3367,7 +3999,7 @@ func (m *ModelProviderService) ParseFile(ctx context.Context, providerName, inst
 			// Note: ParseFile model type is not in the ModelType enum; skip entity-type check
 			// and rely on the factory ModelTypeMap check in the nil-entity branch.
 
-			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, *providerName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
+			modelDriver, err = newModelDriverForBaseURL(info.ProviderInfo.ModelDriver, resolvedProviderName, *info.APIConfig.Region, *info.APIConfig.BaseURL)
 			if err != nil {
 				return nil, common.CodeServerError, err
 			}
@@ -3377,7 +4009,7 @@ func (m *ModelProviderService) ParseFile(ctx context.Context, providerName, inst
 	}
 
 	var response *modelModule.ParseFileResponse
-	response, err = modelDriver.ParseFile(ctx, modelName, content, url, apiConfig, modelConfig, nil)
+	response, err = modelDriver.ParseFile(ctx, &resolvedModelName, content, url, info.APIConfig, modelConfig, nil)
 	if err != nil {
 		return nil, common.CodeServerError, err
 	}
@@ -3849,14 +4481,17 @@ func (m *ModelProviderService) AddModel(ctx context.Context, request *AddModelRe
 	if err != nil {
 		return common.CodeDataError, fmt.Errorf("no instance found for provider '%s' and instance '%s'", request.ProviderName, request.InstanceName)
 	}
-
-	// Check for duplicate model.
-	_, err = m.modelDAO.GetModelByProviderIDAndInstanceIDAndModelName(ctx, dao.DB, provider.ID, instance.ID, modelName)
-	if err == nil {
-		return common.CodeConflict, fmt.Errorf("model '%s' already exists for provider '%s' and instance '%s'", modelName, request.ProviderName, request.InstanceName)
+	normalizedName, changed, err := m.normalizeModelNameAgainstRemoteCatalog(
+		ctx,
+		provider,
+		instance,
+		modelName,
+	)
+	if err != nil {
+		return providerInstanceModelErrorCode(err), err
 	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return common.CodeServerError, err
+	if changed {
+		modelName = normalizedName
 	}
 
 	// Compute model type bitmask. Matches Python's calculate_model_type:
@@ -3916,8 +4551,63 @@ func (m *ModelProviderService) AddModel(ctx context.Context, request *AddModelRe
 		Extra:      string(extraBytes),
 	}
 
-	if err = m.modelDAO.Create(ctx, dao.DB, tenantModel); err != nil {
-		return common.CodeServerError, fmt.Errorf("fail to create model '%s': %s", modelName, err.Error())
+	err = dao.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		lockedProvider, err := m.modelProviderDAO.GetByIDAndTenantIDForUpdate(
+			ctx,
+			tx,
+			provider.ID,
+			tenantID,
+		)
+		if err != nil {
+			return fmt.Errorf("fail to lock model provider: %w", err)
+		}
+		if lockedProvider.ProviderName != provider.ProviderName {
+			return errors.New("model provider changed during validation")
+		}
+
+		lockedInstance, err := m.modelInstanceDAO.GetByIDAndProviderIDForUpdate(
+			ctx,
+			tx,
+			instance.ID,
+			provider.ID,
+		)
+		if err != nil {
+			return fmt.Errorf("fail to lock model instance: %w", err)
+		}
+		if lockedInstance.InstanceName != instance.InstanceName ||
+			lockedInstance.APIKey != instance.APIKey ||
+			lockedInstance.Status != instance.Status ||
+			lockedInstance.Extra != instance.Extra {
+			return errors.New("model instance changed during validation")
+		}
+
+		_, err = m.modelDAO.GetModelByProviderIDAndInstanceIDAndModelName(
+			ctx,
+			tx,
+			provider.ID,
+			instance.ID,
+			modelName,
+		)
+		if err == nil {
+			return fmt.Errorf(
+				"%w %q for provider %q and instance %q",
+				errDuplicateExistingModel,
+				modelName,
+				request.ProviderName,
+				request.InstanceName,
+			)
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("fail to check existing model: %w", err)
+		}
+
+		if err = m.modelDAO.Create(ctx, tx, tenantModel); err != nil {
+			return fmt.Errorf("fail to create model %q: %w", modelName, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return providerInstanceModelErrorCode(err), err
 	}
 
 	return common.CodeSuccess, nil

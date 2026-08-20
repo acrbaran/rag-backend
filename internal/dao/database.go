@@ -111,6 +111,10 @@ func InitDB(ctx context.Context, migrateDB bool) error {
 	sqlDB.SetMaxOpenConns(100)
 	sqlDB.SetConnMaxLifetime(time.Hour)
 
+	if err = RunRequiredStartupMigrations(ctx, DB, migrateDB); err != nil {
+		return fmt.Errorf("failed to run required startup migrations: %w", err)
+	}
+
 	// Auto migrate all dataModels
 	dataModels := []interface{}{
 		&entity.User{},
@@ -163,6 +167,28 @@ func InitDB(ctx context.Context, migrateDB bool) error {
 		// from these tables at runtime, so the Go side must guarantee they exist.
 		&entity.CompilationTemplate{},
 		&entity.CompilationTemplateGroup{},
+	}
+
+	// Phase 14's management API exposes ingestion-task inspection and control.
+	// Older Python-initialized databases do not contain these Go-owned tables.
+	// Create only the missing tables during normal startup; never run broad
+	// schema reconciliation against a version-skewed v0.26.4 database here.
+	for _, model := range []interface{}{
+		&entity.IngestionTask{},
+		&entity.IngestionTaskLog{},
+	} {
+		if DB.WithContext(ctx).Migrator().HasTable(model) {
+			continue
+		}
+		if err = DB.WithContext(ctx).AutoMigrate(model); err != nil {
+			// Admin, API and ingestor processes initialize concurrently. Another
+			// process may create the same missing table between HasTable and
+			// AutoMigrate; accept only that confirmed post-condition.
+			if DB.WithContext(ctx).Migrator().HasTable(model) {
+				continue
+			}
+			return fmt.Errorf("failed to create Phase 14 management table %T: %w", model, err)
+		}
 	}
 
 	if migrateDB {

@@ -162,6 +162,24 @@ func (e *Ingestor) start() error {
 	if err := msgQueueEngine.InitConsumer(common.TaskSubject); err != nil {
 		return err
 	}
+	if subscriber, ok := msgQueueEngine.(interface {
+		SubscribeIngestorShutdown(context.Context, string) (<-chan string, error)
+	}); ok {
+		commands, err := subscriber.SubscribeIngestorShutdown(e.ctx, fmt.Sprintf("ingestor-%s", e.ID()))
+		if err != nil {
+			return fmt.Errorf("subscribe admin shutdown command: %w", err)
+		}
+		e.workerWg.Add(1)
+		go func() {
+			defer e.workerWg.Done()
+			select {
+			case taskID := <-commands:
+				common.Info(fmt.Sprintf("Received admin shutdown task %s for ingestor %s", taskID, e.ID()))
+				e.RequestShutdown()
+			case <-e.ctx.Done():
+			}
+		}()
+	}
 
 	// Start the task worker pool and the dataset-level compile consumer as
 	// owned goroutines joined by Stop via workerWg/compileWg. Start follows
@@ -175,6 +193,16 @@ func (e *Ingestor) start() error {
 	e.workerWg.Add(1)
 	go e.consumeLoop()
 	return nil
+}
+
+// RequestShutdown notifies the cmd-side lifecycle owner. It is idempotent and
+// deliberately does not call Stop from a worker goroutine (which would wait on
+// its own WaitGroup and deadlock).
+func (e *Ingestor) RequestShutdown() {
+	select {
+	case e.ShutdownCh <- struct{}{}:
+	default:
+	}
 }
 
 // consumeLoop is the main tasks.RAGFLOW consume loop. It runs until e.ctx is

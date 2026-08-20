@@ -225,3 +225,56 @@ func TestVllmRerankRejectsOutOfRangeIndex(t *testing.T) {
 		t.Errorf("expected out-of-range error, got %v", err)
 	}
 }
+
+func TestVllmEmbedOmitsUnsupportedDimension(t *testing.T) {
+	withSSRFBypass(t)
+	ctx := t.Context()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != "/embeddings" {
+			t.Errorf("expected path=/embeddings, got %s", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
+			t.Errorf("expected Authorization=%q, got %q", "Bearer test-key", got)
+		}
+
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("invalid JSON body: %v", err)
+			return
+		}
+		if _, ok := body["dimensions"]; ok {
+			t.Errorf("vLLM embeddings request must omit unsupported dimensions field: %v", body)
+		}
+		if body["model"] != "BAAI/bge-small-en-v1.5" {
+			t.Errorf("expected model=BAAI/bge-small-en-v1.5, got %v", body["model"])
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"data": []map[string]interface{}{{"index": 0, "embedding": []float64{0.1, 0.2}}},
+		})
+	}))
+	defer srv.Close()
+
+	model := NewVllmModel(
+		map[string]string{"default": srv.URL},
+		URLSuffix{Embedding: "embeddings"},
+	)
+	apiKey := "test-key"
+	modelName := "BAAI/bge-small-en-v1.5"
+	embeddings, err := model.Embed(
+		ctx,
+		&modelName,
+		[]string{"text"},
+		&APIConfig{ApiKey: &apiKey},
+		&EmbeddingConfig{Dimension: 1024},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Embed failed: %v", err)
+	}
+	if len(embeddings) != 1 || len(embeddings[0].Embedding) != 2 {
+		t.Fatalf("unexpected embeddings response: %+v", embeddings)
+	}
+}

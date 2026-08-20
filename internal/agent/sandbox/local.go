@@ -35,7 +35,7 @@
 // provider is accepted by the other — the model sees the same
 // shape across the two).
 
-//go:build !windows
+//go:build unix
 
 package sandbox
 
@@ -298,14 +298,7 @@ func (p *LocalProvider) ExecuteCode(
 	cmd := exec.CommandContext(ctx, cmdName, cmdArgs...)
 	cmd.Dir = instanceDir
 	cmd.Env = childEnv
-	// pdeath_signal + process group so the subprocess dies
-	// with the parent. On Linux this is SysProcAttr.Pdeathsig;
-	// Setpgid puts the child in its own process group, which
-	// lets us kill the whole group on timeout.
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid:   true,
-		Pdeathsig: syscall.SIGTERM,
-	}
+	cmd.SysProcAttr = localProcessAttributes()
 	// Apply rlimits via pre-start. Go's os/exec does not expose
 	// rlimit directly, so we do it after fork via the parent's
 	// process-group kill. We do NOT replicate the Python

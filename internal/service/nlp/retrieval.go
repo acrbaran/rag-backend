@@ -78,7 +78,7 @@ type RetrievalResult struct {
 // - Build chunks
 // - Build document aggregation if specified
 func (s *RetrievalService) Retrieval(ctx context.Context, req *RetrievalRequest) (*RetrievalResult, error) {
-	common.Info("Retrieval START", zap.String("question", req.Question), zap.Int("page", req.Page), zap.Int("pageSize", req.PageSize))
+	common.Info("Retrieval START", zap.Int("question_length", len(req.Question)), zap.Int("page", req.Page), zap.Int("pageSize", req.PageSize))
 	if req.Question == "" {
 		return &RetrievalResult{Chunks: []map[string]interface{}{}, DocAggs: []map[string]interface{}{}, Total: 0}, nil
 	}
@@ -1018,6 +1018,33 @@ func (s *RetrievalService) PruneDeletedChunks(ctx context.Context, result *Retri
 		return result, nil
 	}
 
+	filteredResult, removed := pruneRetrievalSearchResult(result, existingDocIDs)
+	if removed > 0 {
+		common.Warn("Pruned stale chunks whose documents no longer exist", zap.Int("removed", removed))
+	}
+
+	return filteredResult, nil
+}
+
+func retrievalSearchChunkID(chunk map[string]interface{}) (string, bool) {
+	for _, key := range []string{"_id", "id"} {
+		if id, ok := chunk[key].(string); ok && id != "" {
+			return id, true
+		}
+	}
+	return "", false
+}
+
+// pruneRetrievalSearchResult removes stale document fields while preserving the
+// raw engine chunks needed by second-pass operations such as Elasticsearch KNN.
+func pruneRetrievalSearchResult(result *RetrievalSearchResult, existingDocIDs map[string]struct{}) (*RetrievalSearchResult, int) {
+	rawChunksByID := make(map[string]map[string]interface{}, len(result.Chunks))
+	for _, rawChunk := range result.Chunks {
+		if chunkID, ok := retrievalSearchChunkID(rawChunk); ok {
+			rawChunksByID[chunkID] = rawChunk
+		}
+	}
+
 	// Filter out chunks with deleted documents
 	filteredIDs := make([]string, 0, len(result.IDs))
 	filteredChunks := make([]map[string]interface{}, 0, len(result.IDs))
@@ -1026,16 +1053,21 @@ func (s *RetrievalService) PruneDeletedChunks(ctx context.Context, result *Retri
 	removed := 0
 
 	for _, chunkID := range result.IDs {
-		chunk, exists := result.Field[chunkID]
+		fieldChunk, exists := result.Field[chunkID]
 		if !exists {
 			continue
 		}
-		docID, ok := chunk["doc_id"].(string)
+		rawChunk := fieldChunk
+		if preservedChunk, ok := rawChunksByID[chunkID]; ok {
+			rawChunk = preservedChunk
+		}
+
+		docID, ok := fieldChunk["doc_id"].(string)
 		if !ok || docID == "" {
 			// Keep chunks without doc_id
 			filteredIDs = append(filteredIDs, chunkID)
-			filteredChunks = append(filteredChunks, chunk)
-			filteredField[chunkID] = chunk
+			filteredChunks = append(filteredChunks, rawChunk)
+			filteredField[chunkID] = fieldChunk
 			if result.Highlight != nil {
 				if hl, ok := result.Highlight[chunkID]; ok {
 					filteredHighlight[chunkID] = hl
@@ -1048,17 +1080,13 @@ func (s *RetrievalService) PruneDeletedChunks(ctx context.Context, result *Retri
 			continue
 		}
 		filteredIDs = append(filteredIDs, chunkID)
-		filteredChunks = append(filteredChunks, chunk)
-		filteredField[chunkID] = chunk
+		filteredChunks = append(filteredChunks, rawChunk)
+		filteredField[chunkID] = fieldChunk
 		if result.Highlight != nil {
 			if hl, ok := result.Highlight[chunkID]; ok {
 				filteredHighlight[chunkID] = hl
 			}
 		}
-	}
-
-	if removed > 0 {
-		common.Warn("Pruned stale chunks whose documents no longer exist", zap.Int("removed", removed))
 	}
 
 	return &RetrievalSearchResult{
@@ -1071,7 +1099,8 @@ func (s *RetrievalService) PruneDeletedChunks(ctx context.Context, result *Retri
 		Keywords:    result.Keywords,
 		Aggregation: result.Aggregation,
 		Options:     result.Options,
-	}, nil
+		IndexNames:  result.IndexNames,
+	}, removed
 }
 
 // buildIndexNames creates index names for the given tenant IDs.

@@ -37,8 +37,12 @@ import (
 
 // Handler admin handler
 type Handler struct {
-	service     *Service
-	userService *service.UserService
+	service                   *Service
+	userService               *service.UserService
+	ingestorShutdownPublisher interface {
+		PublishIngestorShutdown(ingestorID, taskID string) error
+	}
+	serverStore *ServerStore
 }
 
 // NewHandler create admin handler
@@ -46,6 +50,7 @@ func NewHandler(svc *Service) *Handler {
 	return &Handler{
 		service:     svc,
 		userService: service.NewUserService(),
+		serverStore: GlobalServerStore,
 	}
 }
 
@@ -1129,14 +1134,37 @@ func (h *Handler) ShutdownIngestor(c *gin.Context) {
 		return
 	}
 
-	taskID := utility.GenerateUUID()
-	//ingestionManager.SubmitTask(&common.TaskAssignment{
-	//	TaskId:     taskID,
-	//	TaskType:   "SHUTDOWN",
-	//	AssignedTo: req.IngestorID,
-	//})
+	store := h.serverStore
+	if store == nil {
+		store = GlobalServerStore
+	}
+	info, ok := store.GetServerInfo(req.IngestorID)
+	if !ok || info.ServerType != common.ServerTypeIngestion {
+		common.ErrorWithCode(c, common.CodeNotFound, "Ingestor not found")
+		return
+	}
+	if time.Since(info.Timestamp) >= 30*time.Second {
+		common.ErrorWithCode(c, common.CodeConflict, "Ingestor heartbeat is stale")
+		return
+	}
 
-	common.SuccessWithData(c, gin.H{"task_id": taskID, "ingestor_id": req.IngestorID}, "Shutdown ingestor")
+	publisher := h.ingestorShutdownPublisher
+	if publisher == nil {
+		publisher, ok = engine.GetMessageQueueEngine().(interface {
+			PublishIngestorShutdown(ingestorID, taskID string) error
+		})
+		if !ok {
+			common.ErrorWithCode(c, common.CodeServerError, "Ingestor shutdown transport is unavailable")
+			return
+		}
+	}
+	taskID := utility.GenerateUUID()
+	if err := publisher.PublishIngestorShutdown(req.IngestorID, taskID); err != nil {
+		common.ErrorWithCode(c, common.CodeServerError, "Failed to submit ingestor shutdown")
+		return
+	}
+	common.ResponseWithHttpCodeData(c, http.StatusAccepted, common.CodeSuccess,
+		gin.H{"task_id": taskID, "ingestor_id": req.IngestorID, "status": "submitted"}, "Shutdown ingestor submitted")
 }
 
 // Reports handle heartbeat reports from servers

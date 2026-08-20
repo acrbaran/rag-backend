@@ -300,9 +300,9 @@ func (h *ProviderHandler) CreateProviderInstance(c *gin.Context) {
 		return
 	}
 
-	_, err := h.modelProviderService.CreateProviderInstance(ctx, providerName, req.InstanceName, apiKey, req.BaseURL, req.Region, userID, req.ModelInfo)
+	code, err := h.modelProviderService.CreateProviderInstance(ctx, providerName, req.InstanceName, apiKey, req.BaseURL, req.Region, userID, req.ModelInfo)
 	if err != nil {
-		common.ErrorWithCode(c, common.CodeServerError, err.Error())
+		common.ErrorWithCode(c, code, err.Error())
 		return
 	}
 
@@ -846,12 +846,16 @@ func (h *ProviderHandler) ChatToModel(c *gin.Context) {
 	userID := c.GetString("user_id")
 	email := c.GetString("email")
 	modelUsage := common.ModelUsage{
-		UserID:       userID,
-		UserEmail:    email,
-		ProviderName: *req.ProviderName,
-		ModelName:    *req.ModelName,
-		Type:         "chat",
-		StartAt:      time.Now(),
+		UserID:    userID,
+		UserEmail: email,
+		Type:      "chat",
+		StartAt:   time.Now(),
+	}
+	if req.ProviderName != nil {
+		modelUsage.ProviderName = *req.ProviderName
+	}
+	if req.ModelName != nil {
+		modelUsage.ModelName = *req.ModelName
 	}
 	// Check if it's a stream request
 	if req.Stream {

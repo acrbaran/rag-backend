@@ -130,28 +130,27 @@ func NewChunkService() *ChunkService {
 //  7. knowledge graph retrieval (not implemented)
 //  8. Apply retrieval by children to group child chunks under parent chunks
 func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.RetrievalTestRequest, userID string) (*service.RetrievalTestResponse, error) {
-	common.Info("RetrievalTest started", zap.String("userID", userID), zap.Any("kbID", req.Datasets), zap.String("question", req.Question))
+	common.Info("RetrievalTest started",
+		zap.String("userID", userID),
+		zap.Any("kbID", req.Datasets),
+		zap.Int("question_length", len(req.Question)))
 
-	common.Debug(fmt.Sprintf("RetrievalTest request:\n"+
-		"    kbID=%v\n"+
-		"    question=%s\n"+
-		"    page=%v, size=%v\n"+
-		"    docIDs=%v\n"+
-		"    useKG=%v, topK=%v\n"+
-		"    crossLanguages=%v\n"+
-		"    searchID=%v\n"+
-		"    filter=%v\n"+
-		"    tenantRerankID=%v\n"+
-		"    rerankID=%v\n"+
-		"    keyword=%v\n"+
-		"    similarityThreshold=%v, vectorSimilarityWeight=%v",
-		req.Datasets, req.Question,
-		common.PtrString(req.Page), common.PtrString(req.Size), req.DocIDs,
-		common.PtrString(req.UseKG), common.PtrString(req.TopK), req.CrossLanguages, common.PtrString(req.SearchID),
-		req.Filter,
-		common.PtrString(req.TenantRerankID), common.PtrString(req.RerankID),
-		common.PtrString(req.Keyword),
-		common.PtrString(req.SimilarityThreshold), common.PtrString(req.VectorSimilarityWeight)))
+	common.Debug("RetrievalTest request",
+		zap.Any("kbID", req.Datasets),
+		zap.Int("question_length", len(req.Question)),
+		zap.String("page", common.PtrString(req.Page)),
+		zap.String("size", common.PtrString(req.Size)),
+		zap.Strings("docIDs", req.DocIDs),
+		zap.String("useKG", common.PtrString(req.UseKG)),
+		zap.String("topK", common.PtrString(req.TopK)),
+		zap.Strings("crossLanguages", req.CrossLanguages),
+		zap.String("searchID", common.PtrString(req.SearchID)),
+		zap.Any("filter", req.Filter),
+		zap.String("tenantRerankID", common.PtrString(req.TenantRerankID)),
+		zap.String("rerankID", common.PtrString(req.RerankID)),
+		zap.String("keyword", common.PtrString(req.Keyword)),
+		zap.String("similarityThreshold", common.PtrString(req.SimilarityThreshold)),
+		zap.String("vectorSimilarityWeight", common.PtrString(req.VectorSimilarityWeight)))
 
 	if req.Question == "" {
 		return nil, fmt.Errorf("question is required")
@@ -328,8 +327,9 @@ func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.Retrieval
 
 	if modifiedQuestion != req.Question {
 		common.Info("Modified question after transformations",
-			zap.String("originalQuestion", req.Question),
-			zap.String("modifiedQuestion", modifiedQuestion),
+			zap.Int("original_question_length", len(req.Question)),
+			zap.Int("modified_question_length", len(modifiedQuestion)),
+			zap.Bool("transformed", true),
 			zap.Strings("crossLanguages", req.CrossLanguages),
 			zap.Bool("keywordExtraction", req.Keyword != nil && *req.Keyword))
 	}
@@ -434,7 +434,11 @@ func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.Retrieval
 	// Infinity/OceanBase chunks already carry real vectors and are left unchanged.
 	hydrateChunkVectors(ctx, s.docEngine, filteredChunks, req.Datasets, tenantIDs)
 
-	common.Info("RetrievalTest completed", zap.String("userID", userID), zap.Any("kbID", req.Datasets), zap.String("question", req.Question), zap.Int64("chunkCount", int64(len(filteredChunks))))
+	common.Info("RetrievalTest completed",
+		zap.String("userID", userID),
+		zap.Any("kbID", req.Datasets),
+		zap.Int("question_length", len(req.Question)),
+		zap.Int("chunk_count", len(filteredChunks)))
 
 	return &service.RetrievalTestResponse{
 		Chunks:  filteredChunks,

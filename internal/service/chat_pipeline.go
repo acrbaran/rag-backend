@@ -270,20 +270,25 @@ func (s *ChatPipelineService) AsyncChat(
 
 		// === Phase 5: Extract Questions, doc_ids, Attachments ===
 		common.Info("Phase 5: Extract questions, doc_ids, attachments")
-		// Retrieve the last 3 user questions.
-		var questions []string
-		for _, m := range messages {
-			if role, _ := m["role"].(string); role == "user" {
-				if content, ok := m["content"].(string); ok {
-					questions = append(questions, content)
-				}
+		boundedMessages := boundedFullQuestionMessages(messages)
+		questions := make([]string, 0, fullQuestionUserTurnLimit)
+		for _, message := range boundedMessages {
+			if message["role"] == "user" {
+				questions = append(questions, message["content"].(string))
 			}
 		}
-		if len(questions) > 3 {
-			questions = questions[len(questions)-3:]
+		if len(questions) == 0 {
+			out <- AsyncChatResult{
+				Answer: "**ERROR**: AsyncChat: no valid user question",
+				Final:  true,
+			}
+			return
 		}
-
-		common.Debug("Extracted questions", zap.Strings("questions", questions))
+		common.Debug("Extracted question metadata",
+			zap.Int("message_count", len(messages)),
+			zap.Int("bounded_message_count", len(boundedMessages)),
+			zap.Int("bounded_user_turn_count", len(questions)),
+			zap.Int("latest_question_length", len(questions[len(questions)-1])))
 
 		// Resolve doc_ids from kwargs or the last message.
 		// Kwargs["doc_ids"] is a comma-separated string.
@@ -499,7 +504,7 @@ func (s *ChatPipelineService) AsyncChat(
 			zap.Strings("param_keys", paramKeys),
 			zap.Bool("has_embd_mdl", embModel != nil),
 			zap.Any("prompt_config.parameters", promptConfig["parameters"]),
-			zap.String("prompt_config.system", systemPrompt))
+			zap.Int("system_prompt_length", len(systemPrompt)))
 
 		// === Phase 8: Query refinement(LLM) ===
 		// Sub-steps: refine_multiturn → cross_languages → meta_data_filter → keyword.
@@ -508,17 +513,22 @@ func (s *ChatPipelineService) AsyncChat(
 
 		// refine_multiturn — condense multi-turn conversation into a single
 		// refined question via LLM. When disabled, simply keep the last question.
+		latestQuestion := questions[len(questions)-1]
 		if refine, _ := chat.PromptConfig["refine_multiturn"].(bool); refine && len(questions) > 1 && chatModel != nil {
-			if refined, err := FullQuestion(ctx, chatModel, messages, ""); err == nil && refined != "" {
-				questions = []string{refined} // replace with refined question
-				common.Debug("refine_multiturn applied",
-					zap.String("refined", truncateForLog(refined, 60)))
-			} else if err != nil {
-				common.Warn("refine_multiturn failed; using original question", zap.Error(err))
+			refined, err := FullQuestion(ctx, chatModel, boundedMessages, "")
+			if err == nil && refined != "" {
+				questions = []string{refined}
+				common.Debug("refine_multiturn completed", zap.String("status", "applied"))
+			} else {
+				questions = []string{latestQuestion}
+				if err != nil {
+					common.Warn("refine_multiturn completed", zap.String("status", "fallback"), zap.Error(err))
+				} else {
+					common.Debug("refine_multiturn completed", zap.String("status", "fallback"))
+				}
 			}
 		} else {
-			// Keep only the last question.
-			questions = questions[len(questions)-1:]
+			questions = []string{latestQuestion}
 		}
 
 		// cross_languages — translate the question into configured target
@@ -532,11 +542,9 @@ func (s *ChatPipelineService) AsyncChat(
 			}
 			if len(langs) > 0 {
 				if translated, err := CrossLanguages(ctx, chat.TenantID, chat.LLMID, questions[0], langs); err == nil && translated != "" {
-					original := questions[0]
 					questions = []string{translated} // replace with translated question
 					common.Debug("cross_languages applied",
-						zap.String("original_question", original),
-						zap.String("translated_question", translated))
+						zap.Int("translated_question_length", len(translated)))
 				} else if err != nil {
 					common.Warn("cross_languages failed", zap.Error(err))
 				}
@@ -579,11 +587,10 @@ func (s *ChatPipelineService) AsyncChat(
 		// append them to the question text to boost lexical retrieval recall.
 		if useKW, _ := chat.PromptConfig["keyword"].(bool); useKW && chatModel != nil && len(questions) > 0 {
 			if kw, err := KeywordExtraction(ctx, chatModel, questions[len(questions)-1], 3); err == nil && kw != "" {
-				original := questions[len(questions)-1]
 				questions[len(questions)-1] = questions[len(questions)-1] + "," + kw
 				common.Debug("keyword extraction applied",
-					zap.String("original_question", original),
-					zap.String("augmented_question", questions[len(questions)-1]))
+					zap.Int("keyword_length", len(kw)),
+					zap.Int("augmented_question_length", len(questions[len(questions)-1])))
 			} else if err != nil {
 				common.Warn("keyword extraction failed", zap.Error(err))
 			}
@@ -836,9 +843,9 @@ func (s *ChatPipelineService) AsyncChat(
 		// If no knowledges and empty_response is configured, yield it and return.
 		knowledges = s.kbPrompt(kbinfos, modelMaxTokens)
 		common.Info("Phase 10: Build LLM Request")
-		common.Debug("Knowledge prompt",
-			zap.String("question", strings.Join(questions, " ")),
-			zap.Strings("knowledges", knowledges))
+		common.Debug("Knowledge prompt metadata",
+			zap.Int("question_count", len(questions)),
+			zap.Int("knowledge_count", len(knowledges)))
 
 		// empty_response check
 		// When no knowledge chunks were retrieved, skip the LLM entirely and
@@ -2279,15 +2286,6 @@ func (s *ChatPipelineService) synthesizeTTS(ctx context.Context, ttsModel *model
 	return ttsResp.Audio
 }
 
-// truncateForLog returns at most n characters of s, appending an
-// ellipsis when truncated. Used to keep zap log lines bounded.
-func truncateForLog(s string, n int) string {
-	if n <= 0 || len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
-}
-
 // resolveReferenceMetadata mirrors Python's
 // `resolve_reference_metadata_preferences` in
 // api/utils/reference_metadata_utils.py:22-62. Returns (include,
@@ -3164,10 +3162,6 @@ func (s *ChatPipelineService) useSQL(
 	if docEngine == nil {
 		return nil, nil
 	}
-
-	// Entry log. Mirrors `logging.debug(f"use_sql: Question: {question}")`
-	// at dialog_service.py:934.
-	common.Debug("SQL retrieval: question", zap.String("question", question))
 
 	// Build the table name. Infinity: ragflow_{tenant}_{kb_id} (one per
 	// KB). ES: ragflow_{tenant} (kb_id in WHERE).
